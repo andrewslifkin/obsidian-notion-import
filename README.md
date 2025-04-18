@@ -45,11 +45,11 @@ Enable "Auto Import" in settings and set your desired interval. The plugin will 
 
 ### Bidirectional Sync
 Enable "Bidirectional Sync" in the settings to:
-- Automatically update Obsidian notes when Notion content changes
-- Push changes from Obsidian back to Notion
-- Smart version tracking to always keep the latest changes
-- Conflict resolution that prioritizes the most recently modified version
-- Visual diff view to help you choose which version to keep when conflicts occur
+- Sync your local Obsidian changes back to Notion
+- Local modifications will update the corresponding Notion pages
+- Sync is triggered when auto-import runs or when manually initiated
+- Simple conflict detection prevents overwriting newer Notion content
+- Use the command palette and search for "Sync Local Changes to Notion" to manually trigger the sync
 
 ### File Naming
 Use the following patterns in the "File Naming Pattern" setting:

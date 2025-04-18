@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, requestUrl, Notice, TFolder, moment, SearchComponent, TFile, TextComponent, SuggestModal, Modal, ButtonComponent } from 'obsidian';
+import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, SuggestModal, TAbstractFile, TFile, TFolder, requestUrl, TextComponent, moment, ButtonComponent } from 'obsidian';
 import { Client } from '@notionhq/client';
 import { PageObjectResponse, BlockObjectResponse } from '@notionhq/client/build/src/api-endpoints';
 
@@ -16,7 +16,8 @@ interface NotionImporterSettings {
     importInterval: number; // in minutes
     useTemplate: boolean;
     templatePath: string;
-    enableSync: boolean;  // New setting for enabling bi-directional sync
+    bidirectionalSync: boolean; // Enable syncing changes back to Notion
+    failedSyncs: { file: string; timestamp: number; error: string }[];
 }
 
 const DEFAULT_SETTINGS: NotionImporterSettings = {
@@ -33,13 +34,15 @@ const DEFAULT_SETTINGS: NotionImporterSettings = {
     importInterval: 60,
     useTemplate: false,
     templatePath: '',
-    enableSync: false  // Default to false for safety
+    bidirectionalSync: false,
+    failedSyncs: []
 }
 
 export default class NotionImporterPlugin extends Plugin {
     settings: NotionImporterSettings;
     notionClient: Client;
     importInterval: number;
+    debounceTimeouts: Record<string, NodeJS.Timeout> = {};
 
     async onload() {
         await this.loadSettings();
@@ -63,21 +66,57 @@ export default class NotionImporterPlugin extends Plugin {
                 this.importFromNotion();
             }
         });
-
+        
+        // Add command for bidirectional sync
         this.addCommand({
-            id: 'notion-sync-current-file',
-            name: 'Sync Current File to Notion',
-            checkCallback: (checking: boolean) => {
-                const activeFile = this.app.workspace.getActiveFile();
-                if (activeFile && this.settings.enableSync) {
-                    if (!checking) {
-                        this.syncFileToNotion(activeFile);
-                    }
-                    return true;
+            id: 'notion-importer-sync',
+            name: 'Sync Local Changes to Notion',
+            callback: () => {
+                if (this.settings.bidirectionalSync) {
+                    this.syncLocalChangesToNotion();
+                } else {
+                    new Notice('Bidirectional sync is not enabled in settings');
                 }
-                return false;
             }
         });
+
+        // Register file modified event for real-time sync
+        this.registerEvent(
+            this.app.vault.on('modify', async (file: TAbstractFile) => {
+                // Only process markdown files
+                if (!(file instanceof TFile) || file.extension !== 'md') {
+                    return;
+                }
+                
+                // Skip if bidirectional sync is disabled
+                if (!this.settings.bidirectionalSync) {
+                    return;
+                }
+                
+                // Check if the file has a Notion page ID
+                const pageId = await this.getNotionPageIdFromFile(file as TFile);
+                if (!pageId) {
+                    return;
+                }
+                
+                console.log(`File modified with Notion page ID: ${file.path}`);
+                
+                // Use debouncing to avoid multiple syncs when a file is modified rapidly
+                if (this.debounceTimeouts && this.debounceTimeouts[file.path]) {
+                    clearTimeout(this.debounceTimeouts[file.path]);
+                }
+                
+                // Initialize debounce timeouts object if it doesn't exist
+                this.debounceTimeouts = this.debounceTimeouts || {};
+                
+                // Set a debounce timeout to sync the file after 2 seconds of inactivity
+                this.debounceTimeouts[file.path] = setTimeout(async () => {
+                    console.log(`Syncing modified file to Notion: ${file.path}`);
+                    await this.syncFileToNotion(file as TFile);
+                    delete this.debounceTimeouts[file.path];
+                }, 2000);
+            })
+        );
 
         // Initialize Notion client with custom fetch implementation
         const customFetch = async (url: string, options: any) => {
@@ -96,6 +135,31 @@ export default class NotionImporterPlugin extends Plugin {
                     body: options.body
                 });
                 
+                // Log response status for debugging
+                console.log(`Response status: ${response.status}`);
+                
+                if (response.status >= 400) {
+                    console.error('Error response:', {
+                        status: response.status,
+                        statusText: response.status,
+                        body: response.json
+                    });
+                    
+                    // Provide more helpful error messages based on status code
+                    let errorMessage = `Notion API Error: ${response.status}`;
+                    if (response.status === 400) {
+                        errorMessage = 'Bad Request (400): Invalid data format sent to Notion API';
+                    } else if (response.status === 401) {
+                        errorMessage = 'Unauthorized (401): Please check your Notion token';
+                    } else if (response.status === 404) {
+                        errorMessage = 'Not Found (404): Resource not found, check your page/database IDs';
+                    } else if (response.status === 429) {
+                        errorMessage = 'Rate Limited (429): Too many requests to Notion API';
+                    }
+                    
+                    throw new Error(errorMessage);
+                }
+                
                 return {
                     ok: response.status >= 200 && response.status < 300,
                     status: response.status,
@@ -110,6 +174,12 @@ export default class NotionImporterPlugin extends Plugin {
                     status: error.status,
                     response: error.response
                 });
+                
+                // Enhance error with more details
+                if (error.response) {
+                    error.message = `${error.message} - Status: ${error.status}, Response: ${JSON.stringify(error.response)}`;
+                }
+                
                 throw error;
             }
         };
@@ -118,25 +188,6 @@ export default class NotionImporterPlugin extends Plugin {
             auth: this.settings.notionToken,
             fetch: customFetch as any
         });
-
-        // Register file event handlers for sync
-        if (this.settings.enableSync) {
-            this.registerEvent(
-                this.app.vault.on('modify', (file) => {
-                    if (file instanceof TFile && file.extension === 'md') {
-                        this.handleFileModification(file);
-                    }
-                })
-            );
-
-            this.registerEvent(
-                this.app.vault.on('rename', (file, oldPath) => {
-                    if (file instanceof TFile && file.extension === 'md') {
-                        this.handleFileRename(file, oldPath);
-                    }
-                })
-            );
-        }
 
         // Setup auto-import if enabled
         if (this.settings.autoImport) {
@@ -173,6 +224,373 @@ export default class NotionImporterPlugin extends Plugin {
             }
         }
         return null;
+    }
+
+    async getNotionPageIdFromFile(file: TFile): Promise<string | null> {
+        const content = await this.app.vault.read(file);
+        const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+        if (frontmatterMatch) {
+            const frontmatter = frontmatterMatch[1];
+            const pageIdMatch = frontmatter.match(/notion_page_id:\s*["']?([^"'\n]+)["']?/);
+            if (pageIdMatch && pageIdMatch[1]) {
+                return pageIdMatch[1];
+            }
+        }
+        return null;
+    }
+
+    async getLastEditedTimeFromFile(file: TFile): Promise<string | null> {
+        const content = await this.app.vault.read(file);
+        const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+        if (frontmatterMatch) {
+            const frontmatter = frontmatterMatch[1];
+            const lastEditedMatch = frontmatter.match(/last_edited_time:\s*["']?([^"'\n]+)["']?/);
+            if (lastEditedMatch && lastEditedMatch[1]) {
+                return lastEditedMatch[1];
+            }
+        }
+        return null;
+    }
+
+    async updateLastEditedTimeInFile(file: TFile, lastEditedTime: string): Promise<void> {
+        const content = await this.app.vault.read(file);
+        const updatedContent = content.replace(
+            /last_edited_time:\s*["']?([^"'\n]+)["']?/,
+            `last_edited_time: "${lastEditedTime}"`
+        );
+        await this.app.vault.modify(file, updatedContent);
+    }
+
+    async syncFileToNotion(file: TFile): Promise<boolean> {
+        try {
+            console.log(`Syncing file to Notion: ${file.path}`);
+            
+            // Get the Notion page ID from frontmatter
+            const pageId = await this.getNotionPageIdFromFile(file);
+            if (!pageId) {
+                console.log(`No Notion page ID found in file: ${file.path}`);
+                return false;
+            }
+            
+            console.log(`Found Notion page ID: ${pageId} for file: ${file.path}`);
+            
+            // Get the last edited time from the frontmatter
+            const localLastEditedTime = await this.getLastEditedTimeFromFile(file);
+            
+            // Check if the page still exists in Notion
+            try {
+                const page = await this.notionClient.pages.retrieve({ page_id: pageId });
+                
+                // Check for conflicts - compare local last edited time with Notion's last edited time
+                if (localLastEditedTime && 'last_edited_time' in page) {
+                    const notionLastEditedTime = page.last_edited_time;
+                    
+                    console.log(`Comparing edit times - Local: ${localLastEditedTime}, Notion: ${notionLastEditedTime}`);
+                    
+                    // If Notion version is newer, we have a conflict
+                    if (new Date(notionLastEditedTime) > new Date(localLastEditedTime)) {
+                        console.log(`Conflict detected: Notion version is newer than local version`);
+                        
+                        // Ask user to resolve conflict
+                        new Notice(`Conflict detected for ${file.basename}. Notion version is newer.`);
+                        
+                        // For now, we'll skip this file to avoid overwriting newer content
+                        // TODO: Implement a proper conflict resolution modal
+                        return false;
+                    }
+                }
+                
+                // Update the page in Notion
+                return await this.syncFileToNotionImpl(file, pageId);
+                
+            } catch (error: any) {
+                console.error(`Error retrieving Notion page: ${error.message}`);
+                if (error.status === 404) {
+                    new Notice(`Notion page not found for ${file.basename}. It may have been deleted.`);
+                } else {
+                    new Notice(`Error syncing to Notion: ${error.message}`);
+                }
+                return false;
+            }
+        } catch (error: any) {
+            console.error(`Error syncing file to Notion: ${error.message}`);
+            new Notice(`Error syncing ${file.basename} to Notion: ${error.message}`);
+            return false;
+        }
+    }
+    
+    async syncFileToNotionImpl(file: TFile, pageId: string): Promise<boolean> {
+        try {
+            console.log(`Starting sync implementation for ${file.path} to Notion page ${pageId}`);
+            
+            // Read the file content
+            const content = await this.app.vault.read(file);
+            
+            // Split content into frontmatter and markdown
+            const parts = content.split(/^---\n([\s\S]*?)\n---\n/);
+            let markdown = '';
+            
+            if (parts.length >= 3) {
+                // If frontmatter exists, markdown is after the frontmatter
+                markdown = parts[2];
+            } else {
+                // No frontmatter, whole content is markdown
+                markdown = content;
+            }
+            
+            // Extract title from frontmatter
+            let title = file.basename;
+            const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+            if (frontmatterMatch) {
+                const frontmatter = frontmatterMatch[1];
+                const titleMatch = frontmatter.match(/title:\s*["']?([^"'\n]+)["']?/);
+                if (titleMatch && titleMatch[1]) {
+                    title = titleMatch[1];
+                }
+            }
+            
+            // Update the page title
+            await this.notionClient.pages.update({
+                page_id: pageId,
+                properties: {
+                    title: {
+                        title: [
+                            {
+                                type: "text",
+                                text: {
+                                    content: title
+                                }
+                            }
+                        ]
+                    }
+                }
+            });
+            
+            console.log(`Updated title for page ${pageId} to: ${title}`);
+            
+            // Clear existing blocks
+            try {
+                // First get all existing blocks
+                const blocks = await this.notionClient.blocks.children.list({
+                    block_id: pageId,
+                    page_size: 100
+                });
+                
+                // Delete blocks in batches to avoid rate limits
+                const batchSize = 10;
+                const blockIds = blocks.results.map(block => block.id);
+                
+                for (let i = 0; i < blockIds.length; i += batchSize) {
+                    const batch = blockIds.slice(i, i + batchSize);
+                    console.log(`Deleting batch of ${batch.length} blocks`);
+                    
+                    // Delete blocks in parallel
+                    await Promise.all(batch.map(blockId => 
+                        this.notionClient.blocks.delete({
+                            block_id: blockId
+                        }).catch(error => {
+                            console.error(`Error deleting block ${blockId}: ${error.message}`);
+                        })
+                    ));
+                    
+                    // Wait a bit to avoid rate limits
+                    if (i + batchSize < blockIds.length) {
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                    }
+                }
+                
+                console.log(`Cleared ${blockIds.length} blocks from page ${pageId}`);
+            } catch (error: any) {
+                console.error(`Error clearing blocks: ${error.message}`);
+                new Notice(`Error clearing content: ${error.message}`);
+                return false;
+            }
+            
+            // Convert markdown to Notion blocks
+            // This is a simplified version - you'd need a proper markdown parser
+            const lines = markdown.trim().split('\n');
+            const blocks: any[] = []; // Use any[] to avoid type errors with BlockObjectRequest
+            
+            let currentParagraph = '';
+            
+            for (const line of lines) {
+                if (line.trim() === '') {
+                    // Empty line ends a paragraph
+                    if (currentParagraph !== '') {
+                        blocks.push({
+                            object: 'block',
+                            type: 'paragraph',
+                            paragraph: {
+                                rich_text: [{
+                                    type: 'text',
+                                    text: {
+                                        content: currentParagraph
+                                    }
+                                }]
+                            }
+                        });
+                        currentParagraph = '';
+                    }
+                } else if (line.startsWith('# ')) {
+                    // Handle heading 1
+                    blocks.push({
+                        object: 'block',
+                        type: 'heading_1',
+                        heading_1: {
+                            rich_text: [{
+                                type: 'text',
+                                text: {
+                                    content: line.slice(2)
+                                }
+                            }]
+                        }
+                    });
+                } else if (line.startsWith('## ')) {
+                    // Handle heading 2
+                    blocks.push({
+                        object: 'block',
+                        type: 'heading_2',
+                        heading_2: {
+                            rich_text: [{
+                                type: 'text',
+                                text: {
+                                    content: line.slice(3)
+                                }
+                            }]
+                        }
+                    });
+                } else if (line.startsWith('### ')) {
+                    // Handle heading 3
+                    blocks.push({
+                        object: 'block',
+                        type: 'heading_3',
+                        heading_3: {
+                            rich_text: [{
+                                type: 'text',
+                                text: {
+                                    content: line.slice(4)
+                                }
+                            }]
+                        }
+                    });
+                } else if (line.startsWith('- ')) {
+                    // Handle bullet lists
+                    blocks.push({
+                        object: 'block',
+                        type: 'bulleted_list_item',
+                        bulleted_list_item: {
+                            rich_text: [{
+                                type: 'text',
+                                text: {
+                                    content: line.slice(2)
+                                }
+                            }]
+                        }
+                    });
+                } else {
+                    // Add to current paragraph
+                    if (currentParagraph !== '') {
+                        currentParagraph += '\n';
+                    }
+                    currentParagraph += line;
+                }
+            }
+            
+            // Add the last paragraph if not empty
+            if (currentParagraph !== '') {
+                blocks.push({
+                    object: 'block',
+                    type: 'paragraph',
+                    paragraph: {
+                        rich_text: [{
+                            type: 'text',
+                            text: {
+                                content: currentParagraph
+                            }
+                        }]
+                    }
+                });
+            }
+            
+            // Add blocks in batches to avoid rate limits
+            const blockBatchSize = 10;
+            
+            for (let i = 0; i < blocks.length; i += blockBatchSize) {
+                const batch = blocks.slice(i, i + blockBatchSize);
+                console.log(`Adding batch of ${batch.length} blocks to page ${pageId}`);
+                
+                await this.notionClient.blocks.children.append({
+                    block_id: pageId,
+                    children: batch
+                });
+                
+                // Wait a bit to avoid rate limits
+                if (i + blockBatchSize < blocks.length) {
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                }
+            }
+            
+            // Update the last edited time in the frontmatter
+            const page = await this.notionClient.pages.retrieve({ page_id: pageId });
+            if ('last_edited_time' in page) {
+                await this.updateLastEditedTimeInFile(file, page.last_edited_time);
+            }
+            
+            console.log(`Successfully synced ${file.path} to Notion page ${pageId}`);
+            new Notice(`Successfully synced ${file.basename} to Notion`);
+            return true;
+        } catch (error: any) {
+            console.error(`Error in sync implementation: ${error.message}`);
+            new Notice(`Error syncing to Notion: ${error.message}`);
+            return false;
+        }
+    }
+
+    async syncLocalChangesToNotion() {
+        if (!this.settings.bidirectionalSync) {
+            return;
+        }
+        
+        try {
+            console.log("Starting sync of local changes to Notion");
+            
+            // Get all markdown files
+            const files = this.app.vault.getMarkdownFiles();
+            let syncedCount = 0;
+            
+            for (const file of files) {
+                // Skip files without a Notion page ID
+                const pageId = await this.getNotionPageIdFromFile(file);
+                if (!pageId) {
+                    continue;
+                }
+                
+                // Check if the local file is newer than Notion
+                const fileModifiedTime = file.stat.mtime;
+                const localLastEditedTime = await this.getLastEditedTimeFromFile(file);
+                
+                if (localLastEditedTime) {
+                    const notionLastEditTime = new Date(localLastEditedTime);
+                    
+                    // If local file is newer than the last known Notion edit time, sync to Notion
+                    if (fileModifiedTime > notionLastEditTime.getTime()) {
+                        console.log(`Local file ${file.path} is newer, syncing to Notion`);
+                        const success = await this.syncFileToNotion(file);
+                        
+                        if (success) {
+                            syncedCount++;
+                        }
+                    }
+                }
+            }
+            
+            if (syncedCount > 0) {
+                new Notice(`Synced ${syncedCount} files to Notion`);
+            }
+        } catch (error: any) {
+            console.error("Error syncing local changes to Notion:", error);
+            new Notice(`Error syncing to Notion: ${error.message}`);
+        }
     }
 
     async importFromNotion() {
@@ -257,32 +675,7 @@ export default class NotionImporterPlugin extends Plugin {
                         // Check if this Notion page has already been imported
                         const existingFile = await this.findFileByNotionPageId(page.id);
                         if (existingFile) {
-                            console.log('Page already imported at:', existingFile.path);
-                            
-                            // Check if the Notion version is newer than the local version
-                            // Get last updated time from Notion
-                            let notionUpdatedTime = (page as PageObjectResponse).last_edited_time;
-                            console.log('Notion last edited time:', notionUpdatedTime);
-                            
-                            // Get local file's modification time
-                            const localStat = await this.app.vault.adapter.stat(existingFile.path);
-                            const localModifiedTime = localStat ? moment(localStat.mtime).format() : moment().format();
-                            console.log('Local file modified time:', localModifiedTime);
-                            
-                            // Simply compare modification times without checking content
-                            if (moment(notionUpdatedTime).isAfter(localModifiedTime)) {
-                                console.log('Notion version is newer, updating local file');
-                                const updatedContent = await this.getPageContent(page.id);
-                                await this.app.vault.modify(existingFile, updatedContent);
-                                new Notice(`Updated ${existingFile.basename} from Notion (newer version found)`);
-                            } else if (moment(localModifiedTime).isAfter(notionUpdatedTime)) {
-                                console.log('Local version is newer, syncing to Notion');
-                                // Sync local changes back to Notion
-                                await this.syncFileToNotion(existingFile);
-                                new Notice(`Synced local changes for ${existingFile.basename} to Notion`);
-                            } else {
-                                console.log('Both versions have the same timestamp, no update needed');
-                            }
+                            console.log('Page already imported at:', existingFile.path + ' - skipping');
                             continue;
                         }
 
@@ -298,7 +691,12 @@ export default class NotionImporterPlugin extends Plugin {
                             new Notice('Successfully imported from Notion');
                         } catch (error) {
                             console.error('Error creating file:', error);
-                            new Notice(`Error creating file ${fileName}: ${error.message}`);
+                            // Don't show error notice for file already exists error
+                            if (error.message && error.message.includes('already exists')) {
+                                console.log(`File ${fileName} already exists - skipping`);
+                            } else {
+                                new Notice(`Error creating file ${fileName}: ${error.message}`);
+                            }
                         }
                     } else {
                         console.log('Skipping page - no title property found');
@@ -574,348 +972,47 @@ export default class NotionImporterPlugin extends Plugin {
     }
 
     startAutoImport() {
-        console.log('Setting up auto-import with interval:', this.settings.importInterval);
-        const interval = this.settings.importInterval * 60 * 1000; // convert minutes to milliseconds
-        
         // Clear any existing interval
         if (this.importInterval) {
             window.clearInterval(this.importInterval);
         }
         
-        // Set up new interval
+        // Set new interval
+        const minutes = this.settings.importInterval;
+        console.log(`Setting up auto-import every ${minutes} minutes`);
+        
         this.importInterval = window.setInterval(() => {
+            console.log('Auto-importing from Notion');
             this.importFromNotion();
             
-            // Also sync local changes back to Notion if bidirectional sync is enabled
-            if (this.settings.enableSync) {
+            // Also sync local changes to Notion if bidirectional sync is enabled
+            if (this.settings.bidirectionalSync) {
+                console.log('Syncing local changes to Notion');
                 this.syncLocalChangesToNotion();
             }
-        }, interval);
+        }, minutes * 60 * 1000);
     }
 
-    onunload() {
+    async onunload() {
         console.log('Unloading Notion Importer plugin');
-        window.clearInterval(this.importInterval);
+        
+        // Clear any auto-import interval
+        if (this.importInterval) {
+            window.clearInterval(this.importInterval);
+        }
+        
+        // Clear any pending debounce timeouts
+        if (this.debounceTimeouts) {
+            Object.values(this.debounceTimeouts).forEach(timeout => {
+                clearTimeout(timeout);
+            });
+        }
         
         // Remove styles
         const styleEl = document.getElementById('notion-importer-styles');
         if (styleEl) {
             styleEl.remove();
         }
-    }
-
-    async syncLocalChangesToNotion() {
-        console.log('Syncing local changes to Notion...');
-        
-        // Find all markdown files with Notion page IDs
-        const files = this.app.vault.getMarkdownFiles();
-        let syncCount = 0;
-        
-        for (const file of files) {
-            try {
-                const content = await this.app.vault.read(file);
-                
-                // Check if this is a Notion-imported file
-                const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
-                if (!frontmatterMatch) continue;
-                
-                const frontmatter = frontmatterMatch[1];
-                const pageIdMatch = frontmatter.match(/notion_page_id: (?:"([^"]+)"|([^\n]+))/);
-                if (!pageIdMatch) continue;
-                
-                const pageId = pageIdMatch[1] || pageIdMatch[2];
-                
-                // Get local modification time
-                const localStat = await this.app.vault.adapter.stat(file.path);
-                if (!localStat) continue;
-                
-                // Try to get the Notion page's last edit time
-                try {
-                    const pageInfo = await this.notionClient.pages.retrieve({ page_id: pageId });
-                    const notionLastEditTime = moment((pageInfo as PageObjectResponse).last_edited_time);
-                    const localModTime = moment(localStat.mtime);
-                    
-                    // Only sync if local is newer than Notion
-                    if (!localModTime.isAfter(notionLastEditTime)) {
-                        console.log(`Skipping ${file.path} - Notion version is newer or same age`);
-                        continue;
-                    }
-                } catch (error) {
-                    console.log(`Couldn't retrieve Notion page info for ${file.path}:`, error);
-                    // If we can't get Notion info, assume we should sync
-                }
-                
-                // File needs syncing, so sync it
-                await this.syncFileToNotion(file);
-                syncCount++;
-                
-            } catch (error) {
-                console.error(`Error syncing file ${file.path}:`, error);
-            }
-        }
-        
-        if (syncCount > 0) {
-            new Notice(`Synced ${syncCount} files to Notion`);
-        }
-    }
-
-    async handleFileModification(file: TFile) {
-        // Debounce the sync to avoid too many API calls
-        if ((file as any)._syncTimeout) {
-            clearTimeout((file as any)._syncTimeout);
-        }
-
-        (file as any)._syncTimeout = setTimeout(async () => {
-            await this.syncFileToNotion(file);
-        }, 2000); // Wait 2 seconds after last modification
-    }
-
-    async handleFileRename(file: TFile, oldPath: string) {
-        await this.syncFileToNotion(file, true);
-    }
-
-    async syncFileToNotion(file: TFile, isRename: boolean = false) {
-        try {
-            const content = await this.app.vault.read(file);
-            
-            // Extract frontmatter
-            const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
-            if (!frontmatterMatch) {
-                return; // No frontmatter, not a Notion-imported file
-            }
-
-            const frontmatter = frontmatterMatch[1];
-            const pageIdMatch = frontmatter.match(/notion_page_id: (?:"([^"]+)"|([^\n]+))/);
-            if (!pageIdMatch) {
-                return; // No Notion page ID, not a Notion-imported file
-            }
-
-            const pageId = pageIdMatch[1] || pageIdMatch[2];
-            console.log('Syncing changes to Notion page:', pageId);
-
-            // Get local modification time
-            const localStat = await this.app.vault.adapter.stat(file.path);
-            const localModifiedTime = localStat ? moment(localStat.mtime) : moment();
-            
-            // Get the title from frontmatter or filename
-            let title = file.basename;
-            const titleMatch = frontmatter.match(/title: (?:"([^"]+)"|([^\n]+))/);
-            if (titleMatch) {
-                title = titleMatch[1] || titleMatch[2];
-            }
-
-            // Extract the content without frontmatter
-            const markdownContent = content.replace(/^---\n[\s\S]*?\n---\n/, '').trim();
-            
-            // Get Notion page's last edit time
-            try {
-                const pageInfo = await this.notionClient.pages.retrieve({ page_id: pageId });
-                const notionLastEditTime = moment((pageInfo as PageObjectResponse).last_edited_time);
-                
-                // Check if the Notion version is newer based only on modification time
-                if (notionLastEditTime.isAfter(localModifiedTime) && !isRename) {
-                    console.log('Notion version is newer than local file');
-                    
-                    // We have a conflict based on dates - show resolution dialog
-                    return new Promise<void>((resolve) => {
-                        const modal = new SyncConflictModal(
-                            this.app, 
-                            (pageInfo as PageObjectResponse).last_edited_time,
-                            localModifiedTime.format(),
-                            this.getPageContent(pageId).then(notionContent => {
-                                modal.setNotionContent(notionContent);
-                            }),
-                            markdownContent,
-                            async (result) => {
-                                if (result === 'notion') {
-                                    // Use Notion version
-                                    const notionContent = await this.getPageContent(pageId);
-                                    await this.app.vault.modify(file, notionContent);
-                                    new Notice(`Updated ${file.basename} from Notion (conflict resolved)`);
-                                } else if (result === 'local') {
-                                    // Continue with syncing the local version to Notion
-                                    await this.syncFileToNotionImpl(file, pageId, title, markdownContent);
-                                    new Notice(`Kept local version of ${file.basename} and synced to Notion`);
-                                } else {
-                                    // Cancel - do nothing
-                                    new Notice('Sync cancelled');
-                                }
-                                resolve();
-                            }
-                        );
-                        modal.open();
-                    });
-                }
-            } catch (error) {
-                console.log('Error retrieving Notion page:', error);
-                // Continue with sync even if we couldn't check for conflicts
-            }
-
-            // If we get here, no conflicts were detected or it's a rename
-            await this.syncFileToNotionImpl(file, pageId, title, markdownContent);
-
-        } catch (error) {
-            console.error('Error syncing to Notion:', error);
-            new Notice(`Error syncing to Notion: ${error.message}`);
-        }
-    }
-
-    // Helper method to actually perform the sync to Notion
-    async syncFileToNotionImpl(file: TFile, pageId: string, title: string, markdownContent: string): Promise<void> {
-        try {
-            // Convert markdown content to Notion blocks
-            const blocks = await this.markdownToBlocks(markdownContent);
-
-            // Update the page title and content in Notion
-            await this.notionClient.pages.update({
-                page_id: pageId,
-                properties: {
-                    'title': {
-                        title: [
-                            {
-                                text: {
-                                    content: title
-                                }
-                            }
-                        ]
-                    }
-                }
-            });
-
-            // First clear existing content to avoid duplication
-            try {
-                // Get existing blocks
-                const existingBlocks = await this.notionClient.blocks.children.list({
-                    block_id: pageId
-                });
-                
-                // Delete each block
-                for (const block of existingBlocks.results) {
-                    await this.notionClient.blocks.delete({
-                        block_id: block.id
-                    });
-                }
-            } catch (error) {
-                console.error('Error clearing existing blocks:', error);
-            }
-
-            // Add new content
-            await this.notionClient.blocks.children.append({
-                block_id: pageId,
-                children: blocks
-            });
-
-            console.log('Successfully synced changes to Notion');
-            new Notice('Successfully synced to Notion');
-            
-        } catch (error) {
-            console.error('Error in syncFileToNotionImpl:', error);
-            throw error;
-        }
-    }
-
-    async markdownToBlocks(markdown: string): Promise<any[]> {
-        const blocks: any[] = [];
-        const lines = markdown.split('\n');
-        let currentIndentLevel = 0;
-        let blockStack: any[] = [];
-        
-        const getIndentLevel = (line: string): number => {
-            const match = line.match(/^(\s*)/);
-            return match ? Math.floor(match[1].length / 4) : 0;
-        };
-        
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            const indentLevel = getIndentLevel(line);
-            const trimmedLine = line.trim();
-            if (!trimmedLine) continue;
-
-            const block = {
-                object: 'block',
-                type: '',
-                has_children: false,
-                children: []
-            } as any;
-
-            if (trimmedLine.startsWith('# ')) {
-                block.type = 'heading_1';
-                block.heading_1 = {
-                    rich_text: [{ type: 'text', text: { content: trimmedLine.substring(2) } }]
-                };
-            } else if (trimmedLine.startsWith('## ')) {
-                block.type = 'heading_2';
-                block.heading_2 = {
-                    rich_text: [{ type: 'text', text: { content: trimmedLine.substring(3) } }]
-                };
-            } else if (trimmedLine.startsWith('### ')) {
-                block.type = 'heading_3';
-                block.heading_3 = {
-                    rich_text: [{ type: 'text', text: { content: trimmedLine.substring(4) } }]
-                };
-            } else if (trimmedLine.startsWith('- ')) {
-                block.type = 'bulleted_list_item';
-                block.bulleted_list_item = {
-                    rich_text: [{ type: 'text', text: { content: trimmedLine.substring(2) } }]
-                };
-            } else if (trimmedLine.match(/^\d+\. /)) {
-                block.type = 'numbered_list_item';
-                block.numbered_list_item = {
-                    rich_text: [{ type: 'text', text: { content: trimmedLine.substring(trimmedLine.indexOf(' ') + 1) } }]
-                };
-            } else if (trimmedLine.startsWith('> ')) {
-                block.type = 'quote';
-                block.quote = {
-                    rich_text: [{ type: 'text', text: { content: trimmedLine.substring(2) } }]
-                };
-            } else if (trimmedLine.startsWith('```')) {
-                block.type = 'code';
-                let codeContent = '';
-                const language = trimmedLine.substring(3);
-                i++;
-                while (i < lines.length && !lines[i].trim().startsWith('```')) {
-                    codeContent += lines[i] + '\n';
-                    i++;
-                }
-                block.code = {
-                    language: language || 'plain text',
-                    rich_text: [{ type: 'text', text: { content: codeContent.trim() } }]
-                };
-            } else {
-                block.type = 'paragraph';
-                block.paragraph = {
-                    rich_text: [{ type: 'text', text: { content: trimmedLine } }]
-                };
-            }
-
-            // Handle indentation
-            if (indentLevel > currentIndentLevel) {
-                // This is a child block
-                if (blockStack.length > 0) {
-                    const parent = blockStack[blockStack.length - 1];
-                    parent.has_children = true;
-                    if (!parent.children) parent.children = [];
-                    parent.children.push(block);
-                }
-            } else {
-                // This is a sibling or parent level block
-                while (blockStack.length > indentLevel) {
-                    blockStack.pop();
-                }
-                if (blockStack.length === 0) {
-                    blocks.push(block);
-                } else {
-                    const parent = blockStack[blockStack.length - 1];
-                    if (!parent.children) parent.children = [];
-                    parent.children.push(block);
-                }
-            }
-
-            blockStack[indentLevel] = block;
-            currentIndentLevel = indentLevel;
-        }
-
-        return blocks;
     }
 
     // Add CSS styles for the diff view
@@ -1135,6 +1232,19 @@ class NotionImporterSettingTab extends PluginSettingTab {
                     this.updatePreview();
                 }));
 
+        // Synchronization Settings
+        containerEl.createEl('h3', {text: 'Synchronization Settings'});
+
+        new Setting(containerEl)
+            .setName('Bidirectional Sync')
+            .setDesc('Enable syncing local changes back to Notion (changes in Obsidian will be reflected in Notion)')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.bidirectionalSync)
+                .onChange(async (value) => {
+                    this.plugin.settings.bidirectionalSync = value;
+                    await this.plugin.saveSettings();
+                }));
+
         // Auto Import Settings
         containerEl.createEl('h3', {text: 'Auto Import Settings'});
 
@@ -1199,19 +1309,6 @@ class NotionImporterSettingTab extends PluginSettingTab {
                 (text.inputEl as any)._fileSuggestListener = focusListener;
                 text.inputEl.addEventListener('focus', focusListener);
             });
-
-        // Add Sync Settings
-        containerEl.createEl('h3', {text: 'Sync Settings'});
-
-        new Setting(containerEl)
-            .setName('Enable Bi-directional Sync')
-            .setDesc('Sync changes from Obsidian back to Notion (requires restart to take effect)')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.enableSync)
-                .onChange(async (value) => {
-                    this.plugin.settings.enableSync = value;
-                    await this.plugin.saveSettings();
-                }));
     }
 
     updatePreview() {
@@ -1278,219 +1375,5 @@ class FileSuggestModal extends SuggestModal<string> {
             delete (this.textComponent.inputEl as any)._fileSuggestListener;
         }
         this.close();
-    }
-}
-
-class SyncConflictModal extends Modal {
-    private result: string = 'cancel';
-    private callback: (result: string) => void;
-    private notionContent: string = '';
-    private localContent: string;
-    private diffView: HTMLElement | null = null;
-    private diffContainer: HTMLElement | null = null;
-
-    constructor(
-        app: App, 
-        private notionTime: string, 
-        private localTime: string, 
-        notionContentPromise: Promise<void>,
-        localContent: string,
-        callback: (result: string) => void
-    ) {
-        super(app);
-        this.callback = callback;
-        this.localContent = localContent;
-    }
-
-    setNotionContent(content: string) {
-        this.notionContent = content;
-        this.updateDiffView();
-    }
-
-    updateDiffView() {
-        if (this.diffContainer && this.notionContent) {
-            if (this.diffView) {
-                this.diffContainer.removeChild(this.diffView);
-            }
-            this.diffView = this.createDiffView(this.notionContent, this.localContent);
-            this.diffContainer.appendChild(this.diffView);
-        }
-    }
-
-    onOpen() {
-        const {contentEl} = this;
-        
-        contentEl.createEl('h2', {text: 'Sync Conflict Detected'});
-        
-        contentEl.createEl('p', {text: 'There are conflicting modification timestamps between Notion and Obsidian:'});
-        
-        const infoDiv = contentEl.createDiv({cls: 'sync-info'});
-        infoDiv.createEl('p', {text: `Notion last edited: ${moment(this.notionTime).format('YYYY-MM-DD HH:mm:ss')}`});
-        infoDiv.createEl('p', {text: `Local last modified: ${moment(this.localTime).format('YYYY-MM-DD HH:mm:ss')}`});
-        
-        // Add diff view - will be populated when Notion content is available
-        this.diffContainer = contentEl.createDiv({cls: 'diff-container'});
-        if (this.notionContent) {
-            this.diffView = this.createDiffView(this.notionContent, this.localContent);
-            this.diffContainer.appendChild(this.diffView);
-        } else {
-            const loadingEl = document.createElement('p');
-            loadingEl.textContent = 'Loading diff view...';
-            this.diffContainer.appendChild(loadingEl);
-        }
-        
-        const buttonDiv = contentEl.createDiv({cls: 'sync-buttons'});
-        
-        const keepNotionBtn = new ButtonComponent(buttonDiv)
-            .setButtonText('Keep Notion Version')
-            .onClick(() => {
-                this.result = 'notion';
-                this.close();
-            });
-            
-        const keepLocalBtn = new ButtonComponent(buttonDiv)
-            .setButtonText('Keep Local Version')
-            .onClick(() => {
-                this.result = 'local';
-                this.close();
-            });
-            
-        const cancelBtn = new ButtonComponent(buttonDiv)
-            .setButtonText('Cancel')
-            .onClick(() => {
-                this.result = 'cancel';
-                this.close();
-            });
-    }
-
-    // Create a diff view between two text contents
-    private createDiffView(oldContent: string, newContent: string): HTMLElement {
-        const container = document.createElement('div');
-        container.addClass('diff-view');
-        
-        // Split content into lines
-        const oldLines = oldContent.split('\n');
-        const newLines = newContent.split('\n');
-        
-        // Create diff table
-        const diffTable = document.createElement('table');
-        diffTable.addClass('diff-table');
-        
-        // Add header
-        const header = document.createElement('tr');
-        const notionHeader = document.createElement('th');
-        notionHeader.textContent = 'Notion Version';
-        const obsidianHeader = document.createElement('th');
-        obsidianHeader.textContent = 'Obsidian Version';
-        header.appendChild(notionHeader);
-        header.appendChild(obsidianHeader);
-        diffTable.appendChild(header);
-        
-        // Create line index maps
-        const diffMap = this.computeDiff(oldLines, newLines);
-        
-        // Maximum lines to display
-        const maxDisplayLines = 500; // Limit to prevent UI slowdown
-        let displayedLines = 0;
-        
-        // Add content rows
-        for (const [oldIndex, newIndex] of diffMap) {
-            if (displayedLines >= maxDisplayLines) break;
-            
-            const row = document.createElement('tr');
-            
-            const oldCell = document.createElement('td');
-            const newCell = document.createElement('td');
-            
-            // Fill old content cell
-            if (oldIndex !== null) {
-                oldCell.textContent = oldLines[oldIndex];
-                if (newIndex === null) {
-                    oldCell.addClass('diff-removed');
-                }
-            }
-            
-            // Fill new content cell
-            if (newIndex !== null) {
-                newCell.textContent = newLines[newIndex];
-                if (oldIndex === null) {
-                    newCell.addClass('diff-added');
-                }
-            }
-            
-            // Highlight changes in modified lines
-            if (oldIndex !== null && newIndex !== null && oldLines[oldIndex] !== newLines[newIndex]) {
-                oldCell.addClass('diff-modified');
-                newCell.addClass('diff-modified');
-            }
-            
-            row.appendChild(oldCell);
-            row.appendChild(newCell);
-            diffTable.appendChild(row);
-            
-            displayedLines++;
-        }
-        
-        // Add a note if content was truncated
-        if (diffMap.length > maxDisplayLines) {
-            const truncatedRow = document.createElement('tr');
-            const truncatedCell = document.createElement('td');
-            truncatedCell.colSpan = 2;
-            truncatedCell.textContent = `(${diffMap.length - maxDisplayLines} more differences not shown)`;
-            truncatedCell.addClass('diff-truncated');
-            truncatedRow.appendChild(truncatedCell);
-            diffTable.appendChild(truncatedRow);
-        }
-        
-        container.appendChild(diffTable);
-        return container;
-    }
-    
-    // Compute a simplified diff between two arrays of lines
-    // Returns an array of pairs [oldIndex, newIndex] where either can be null for added/removed lines
-    private computeDiff(oldLines: string[], newLines: string[]): Array<[number | null, number | null]> {
-        const result: Array<[number | null, number | null]> = [];
-        
-        // Build LCS (Longest Common Subsequence) matrix
-        const matrix: number[][] = Array(oldLines.length + 1).fill(0).map(() => Array(newLines.length + 1).fill(0));
-        
-        for (let i = 1; i <= oldLines.length; i++) {
-            for (let j = 1; j <= newLines.length; j++) {
-                if (oldLines[i - 1] === newLines[j - 1]) {
-                    matrix[i][j] = matrix[i - 1][j - 1] + 1;
-                } else {
-                    matrix[i][j] = Math.max(matrix[i - 1][j], matrix[i][j - 1]);
-                }
-            }
-        }
-        
-        // Backtrack to find the diff
-        let i = oldLines.length;
-        let j = newLines.length;
-        
-        const backtrack: Array<[number | null, number | null]> = [];
-        
-        while (i > 0 || j > 0) {
-            if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
-                backtrack.push([i - 1, j - 1]); // Match
-                i--;
-                j--;
-            } else if (j > 0 && (i === 0 || matrix[i][j - 1] >= matrix[i - 1][j])) {
-                backtrack.push([null, j - 1]); // Addition
-                j--;
-            } else if (i > 0) {
-                backtrack.push([i - 1, null]); // Deletion
-                i--;
-            }
-        }
-        
-        // Reverse and return
-        return backtrack.reverse();
-    }
-
-    onClose() {
-        const {contentEl} = this;
-        contentEl.empty();
-        this.callback(this.result);
     }
 } 
