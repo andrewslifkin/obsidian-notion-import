@@ -1,0 +1,9 @@
+{
+    "id": "obsidian-notion-importer",
+    "name": "Notion Importer",
+    "version": "1.0.0",
+    "minAppVersion": "0.15.0",
+    "description": "Import entries from Notion databases into Obsidian",
+    "author": "Andrew Slifkin",
+    "isDesktopOnly": false
+} 
