@@ -1,6 +1,7 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, SuggestModal, TAbstractFile, TFile, TFolder, requestUrl, TextComponent, moment, ButtonComponent } from 'obsidian';
 import { Client } from '@notionhq/client';
 import { PageObjectResponse, BlockObjectResponse } from '@notionhq/client/build/src/api-endpoints';
+import { withRetry, listAllChildBlocks, getNotionPageIdFromContent, getLastEditedTimeFromContent, setLastEditedTimeInContent, parseTitleFromFrontmatter, pathIsWithinFolder, ConflictResolutionModal } from './src/utils';
 
 interface NotionImporterSettings {
     notionToken: string;
@@ -43,6 +44,9 @@ export default class NotionImporterPlugin extends Plugin {
     notionClient: Client;
     importInterval: number;
     debounceTimeouts: Record<string, NodeJS.Timeout> = {};
+    private isImportRunning: boolean = false;
+    private isTwoWaySyncRunning: boolean = false;
+    private syncingFiles: Set<string> = new Set();
 
     async onload() {
         await this.loadSettings();
@@ -79,6 +83,28 @@ export default class NotionImporterPlugin extends Plugin {
                 }
             }
         });
+        // Add combined two-way sync command
+        this.addCommand({
+            id: 'notion-importer-sync-bidirectional',
+            name: 'Sync Notion ↔ Obsidian',
+            callback: async () => {
+                if (!this.settings.bidirectionalSync) {
+                    new Notice('Bidirectional sync is not enabled in settings');
+                    return;
+                }
+                if (this.isTwoWaySyncRunning) {
+                    console.log('Two-way sync already running, skipping');
+                    return;
+                }
+                this.isTwoWaySyncRunning = true;
+                try {
+                    await this.importFromNotion();
+                    await this.syncLocalChangesToNotion();
+                } finally {
+                    this.isTwoWaySyncRunning = false;
+                }
+            }
+        });
 
         // Register file modified event for real-time sync
         this.registerEvent(
@@ -90,6 +116,10 @@ export default class NotionImporterPlugin extends Plugin {
                 
                 // Skip if bidirectional sync is disabled
                 if (!this.settings.bidirectionalSync) {
+                    return;
+                }
+                // Only sync files inside the configured destination folder
+                if (!pathIsWithinFolder(file.path, this.settings.destinationFolder)) {
                     return;
                 }
                 
@@ -264,11 +294,17 @@ export default class NotionImporterPlugin extends Plugin {
     async syncFileToNotion(file: TFile): Promise<boolean> {
         try {
             console.log(`Syncing file to Notion: ${file.path}`);
+            if (this.syncingFiles.has(file.path)) {
+                console.log('Sync already in progress for file, skipping:', file.path);
+                return false;
+            }
+            this.syncingFiles.add(file.path);
             
             // Get the Notion page ID from frontmatter
             const pageId = await this.getNotionPageIdFromFile(file);
             if (!pageId) {
                 console.log(`No Notion page ID found in file: ${file.path}`);
+                this.syncingFiles.delete(file.path);
                 return false;
             }
             
@@ -279,7 +315,7 @@ export default class NotionImporterPlugin extends Plugin {
             
             // Check if the page still exists in Notion
             try {
-                const page = await this.notionClient.pages.retrieve({ page_id: pageId });
+                const page = await withRetry(() => this.notionClient.pages.retrieve({ page_id: pageId }));
                 
                 // Check for conflicts - compare local last edited time with Notion's last edited time
                 if (localLastEditedTime && 'last_edited_time' in page) {
@@ -290,18 +326,28 @@ export default class NotionImporterPlugin extends Plugin {
                     // If Notion version is newer, we have a conflict
                     if (new Date(notionLastEditedTime) > new Date(localLastEditedTime)) {
                         console.log(`Conflict detected: Notion version is newer than local version`);
-                        
                         // Ask user to resolve conflict
-                        new Notice(`Conflict detected for ${file.basename}. Notion version is newer.`);
-                        
-                        // For now, we'll skip this file to avoid overwriting newer content
-                        // TODO: Implement a proper conflict resolution modal
-                        return false;
+                        const choice = await new Promise<'keep-local' | 'keep-notion' | 'cancel'>(resolve => {
+                            const modal = new ConflictResolutionModal(this.app, resolve);
+                            modal.open();
+                        });
+                        if (choice === 'cancel') {
+                            this.syncingFiles.delete(file.path);
+                            return false;
+                        } else if (choice === 'keep-notion') {
+                            // Overwrite local from Notion
+                            const content = await this.getPageContent(pageId);
+                            await this.app.vault.modify(file, content);
+                            this.syncingFiles.delete(file.path);
+                            return true;
+                        }
                     }
                 }
                 
                 // Update the page in Notion
-                return await this.syncFileToNotionImpl(file, pageId);
+                const ok = await this.syncFileToNotionImpl(file, pageId);
+                this.syncingFiles.delete(file.path);
+                return ok;
                 
             } catch (error: any) {
                 console.error(`Error retrieving Notion page: ${error.message}`);
@@ -310,11 +356,13 @@ export default class NotionImporterPlugin extends Plugin {
                 } else {
                     new Notice(`Error syncing to Notion: ${error.message}`);
                 }
+                this.syncingFiles.delete(file.path);
                 return false;
             }
         } catch (error: any) {
             console.error(`Error syncing file to Notion: ${error.message}`);
             new Notice(`Error syncing ${file.basename} to Notion: ${error.message}`);
+            this.syncingFiles.delete(file.path);
             return false;
         }
     }
@@ -339,18 +387,10 @@ export default class NotionImporterPlugin extends Plugin {
             }
             
             // Extract title from frontmatter
-            let title = file.basename;
-            const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
-            if (frontmatterMatch) {
-                const frontmatter = frontmatterMatch[1];
-                const titleMatch = frontmatter.match(/title:\s*["']?([^"'\n]+)["']?/);
-                if (titleMatch && titleMatch[1]) {
-                    title = titleMatch[1];
-                }
-            }
+            let title = parseTitleFromFrontmatter(content, file.basename);
             
             // Update the page title
-            await this.notionClient.pages.update({
+            await withRetry(() => this.notionClient.pages.update({
                 page_id: pageId,
                 properties: {
                     title: {
@@ -364,33 +404,28 @@ export default class NotionImporterPlugin extends Plugin {
                         ]
                     }
                 }
-            });
+            }));
             
             console.log(`Updated title for page ${pageId} to: ${title}`);
             
             // Clear existing blocks
             try {
-                // First get all existing blocks
-                const blocks = await this.notionClient.blocks.children.list({
-                    block_id: pageId,
-                    page_size: 100
-                });
-                
+                // First get all existing blocks (paginated)
+                const allBlocks = await listAllChildBlocks(this.notionClient, pageId);
                 // Delete blocks in batches to avoid rate limits
                 const batchSize = 10;
-                const blockIds = blocks.results.map(block => block.id);
+                const blockIds = allBlocks.map(block => block.id);
                 
                 for (let i = 0; i < blockIds.length; i += batchSize) {
                     const batch = blockIds.slice(i, i + batchSize);
                     console.log(`Deleting batch of ${batch.length} blocks`);
                     
                     // Delete blocks in parallel
-                    await Promise.all(batch.map(blockId => 
-                        this.notionClient.blocks.delete({
-                            block_id: blockId
-                        }).catch(error => {
-                            console.error(`Error deleting block ${blockId}: ${error.message}`);
-                        })
+                    await Promise.all(batch.map(blockId =>
+                        withRetry(() => this.notionClient.blocks.delete({ block_id: blockId }))
+                            .catch(error => {
+                                console.error(`Error deleting block ${blockId}: ${error.message}`);
+                            })
                     ));
                     
                     // Wait a bit to avoid rate limits
@@ -519,10 +554,10 @@ export default class NotionImporterPlugin extends Plugin {
                 const batch = blocks.slice(i, i + blockBatchSize);
                 console.log(`Adding batch of ${batch.length} blocks to page ${pageId}`);
                 
-                await this.notionClient.blocks.children.append({
+                await withRetry(() => this.notionClient.blocks.children.append({
                     block_id: pageId,
                     children: batch
-                });
+                }));
                 
                 // Wait a bit to avoid rate limits
                 if (i + blockBatchSize < blocks.length) {
@@ -531,7 +566,7 @@ export default class NotionImporterPlugin extends Plugin {
             }
             
             // Update the last edited time in the frontmatter
-            const page = await this.notionClient.pages.retrieve({ page_id: pageId });
+            const page = await withRetry(() => this.notionClient.pages.retrieve({ page_id: pageId }));
             if ('last_edited_time' in page) {
                 await this.updateLastEditedTimeInFile(file, page.last_edited_time);
             }
@@ -559,6 +594,10 @@ export default class NotionImporterPlugin extends Plugin {
             let syncedCount = 0;
             
             for (const file of files) {
+                // Only consider files within the destination folder
+                if (!pathIsWithinFolder(file.path, this.settings.destinationFolder)) {
+                    continue;
+                }
                 // Skip files without a Notion page ID
                 const pageId = await this.getNotionPageIdFromFile(file);
                 if (!pageId) {
@@ -595,13 +634,20 @@ export default class NotionImporterPlugin extends Plugin {
 
     async importFromNotion() {
         try {
+            if (this.isImportRunning) {
+                console.log('Import already running, skipping');
+                return;
+            }
+            this.isImportRunning = true;
             // Validate settings
             if (!this.settings.notionToken) {
                 new Notice('Please set your Notion integration token in settings');
+                this.isImportRunning = false;
                 return;
             }
             if (!this.settings.databaseId) {
                 new Notice('Please set your Notion database ID in settings');
+                this.isImportRunning = false;
                 return;
             }
 
@@ -611,9 +657,9 @@ export default class NotionImporterPlugin extends Plugin {
             // Test database access
             try {
                 console.log('Testing database access with ID:', this.settings.databaseId);
-                await this.notionClient.databases.retrieve({
+                await withRetry(() => this.notionClient.databases.retrieve({
                     database_id: this.settings.databaseId,
-                });
+                }));
             } catch (error: any) {
                 console.error('Database access error:', error);
                 if (error.status === 404) {
@@ -623,18 +669,20 @@ export default class NotionImporterPlugin extends Plugin {
                 } else {
                     new Notice(`Error accessing database: ${error.message}`);
                 }
+                this.isImportRunning = false;
                 return;
             }
 
             console.log('Querying database...');
-            const response = await this.notionClient.databases.query({
+            const response = await withRetry(() => this.notionClient.databases.query({
                 database_id: this.settings.databaseId,
-            });
+            }));
 
             console.log('Database query response:', response);
 
             if (!response.results || response.results.length === 0) {
                 new Notice('No entries found in the database');
+                this.isImportRunning = false;
                 return;
             }
 
@@ -675,7 +723,18 @@ export default class NotionImporterPlugin extends Plugin {
                         // Check if this Notion page has already been imported
                         const existingFile = await this.findFileByNotionPageId(page.id);
                         if (existingFile) {
-                            console.log('Page already imported at:', existingFile.path + ' - skipping');
+                            console.log('Page already imported at:', existingFile.path);
+                            // Compare edit times and update if Notion is newer
+                            const localContent = await this.app.vault.read(existingFile);
+                            const localLastEdited = getLastEditedTimeFromContent(localContent);
+                            const notionLastEdited = (page as any).last_edited_time as string | undefined;
+                            if (notionLastEdited && localLastEdited && new Date(notionLastEdited) > new Date(localLastEdited)) {
+                                console.log('Notion page is newer, updating local file');
+                                await this.app.vault.modify(existingFile, content);
+                                new Notice(`Updated ${existingFile.basename} from Notion`);
+                            } else {
+                                console.log('Local file is up to date - skipping');
+                            }
                             continue;
                         }
 
@@ -706,29 +765,31 @@ export default class NotionImporterPlugin extends Plugin {
                     console.log('Skipping page - no properties found');
                 }
             }
+            this.isImportRunning = false;
         } catch (error: any) {
             console.error('Error importing from Notion:', error);
             new Notice(`Error importing from Notion: ${error.message}`);
+            this.isImportRunning = false;
         }
     }
 
     async getPageContent(pageId: string): Promise<string> {
         console.log('Fetching content for page:', pageId);
-        const blocks = await this.notionClient.blocks.children.list({
+        const blocks = await withRetry(() => this.notionClient.blocks.children.list({
             block_id: pageId,
             page_size: 100
-        });
+        }));
 
         let allBlocks = [...blocks.results];
         let nextCursor = blocks.next_cursor;
 
         // Fetch all blocks using pagination
         while (nextCursor) {
-            const moreBlocks = await this.notionClient.blocks.children.list({
+            const moreBlocks = await withRetry(() => this.notionClient.blocks.children.list({
                 block_id: pageId,
                 start_cursor: nextCursor,
                 page_size: 100
-            });
+            }));
             allBlocks = [...allBlocks, ...moreBlocks.results];
             nextCursor = moreBlocks.next_cursor;
         }
@@ -771,7 +832,7 @@ export default class NotionImporterPlugin extends Plugin {
         }
 
         // Add page metadata
-        const page = await this.notionClient.pages.retrieve({ page_id: pageId });
+        const page = await withRetry(() => this.notionClient.pages.retrieve({ page_id: pageId }));
         if ('properties' in page) {
             // Add required frontmatter fields
             frontmatterFields['imported_from'] = 'notion';
@@ -829,20 +890,18 @@ export default class NotionImporterPlugin extends Plugin {
             // Get children blocks if they exist
             let children: any[] = [];
             if ('has_children' in block && block.has_children) {
-                const childBlocks = await this.notionClient.blocks.children.list({
-                    block_id: block.id
-                });
-                children = childBlocks.results;
+                const childBlocks = await listAllChildBlocks(this.notionClient, block.id);
+                children = childBlocks;
             }
             
             const markdown = await this.blockToMarkdown(block as BlockObjectResponse, children);
             if (!markdown) continue;
 
             // Handle list continuity and indentation
-            if (['bulleted_list_item', 'numbered_list_item', 'to_do'].includes(block.type)) {
-                if (currentListType !== block.type) {
+            if (['bulleted_list_item', 'numbered_list_item', 'to_do'].includes((block as any).type)) {
+                if (currentListType !== (block as any).type) {
                     if (currentListType) formattedContent += '\n';
-                    currentListType = block.type;
+                    currentListType = (block as any).type;
                     indentLevel = 0;
                 }
                 formattedContent += markdown + '\n';
@@ -872,10 +931,8 @@ export default class NotionImporterPlugin extends Plugin {
                 // Get nested children
                 let nestedChildren: any[] = [];
                 if ('has_children' in child && child.has_children) {
-                    const nestedBlocks = await this.notionClient.blocks.children.list({
-                        block_id: child.id
-                    });
-                    nestedChildren = nestedBlocks.results;
+                    const nestedBlocks = await listAllChildBlocks(this.notionClient, child.id);
+                    nestedChildren = nestedBlocks;
                 }
                 
                 const childMarkdown = await this.blockToMarkdown(child as BlockObjectResponse, nestedChildren);
@@ -983,12 +1040,20 @@ export default class NotionImporterPlugin extends Plugin {
         
         this.importInterval = window.setInterval(() => {
             console.log('Auto-importing from Notion');
-            this.importFromNotion();
+            if (!this.isImportRunning && !this.isTwoWaySyncRunning) {
+                this.importFromNotion();
+            } else {
+                console.log('Skipping auto-import; another sync is running');
+            }
             
             // Also sync local changes to Notion if bidirectional sync is enabled
             if (this.settings.bidirectionalSync) {
                 console.log('Syncing local changes to Notion');
-                this.syncLocalChangesToNotion();
+                if (!this.isTwoWaySyncRunning) {
+                    this.syncLocalChangesToNotion();
+                } else {
+                    console.log('Skipping local sync; another sync is running');
+                }
             }
         }, minutes * 60 * 1000);
     }
@@ -1327,7 +1392,7 @@ class FolderSuggestModal extends SuggestModal<string> {
     getSuggestions(query: string): string[] {
         const lowercaseQuery = query.toLowerCase();
         return this.folders
-            .filter(f => f.toLowerCase().contains(lowercaseQuery))
+            .filter(f => f.toLowerCase().includes(lowercaseQuery))
             .sort((a, b) => a.length - b.length);
     }
 
@@ -1355,7 +1420,7 @@ class FileSuggestModal extends SuggestModal<string> {
     getSuggestions(query: string): string[] {
         const lowercaseQuery = query.toLowerCase();
         return this.files
-            .filter(f => f.toLowerCase().contains(lowercaseQuery))
+            .filter(f => f.toLowerCase().includes(lowercaseQuery))
             .sort((a, b) => a.length - b.length);
     }
 
