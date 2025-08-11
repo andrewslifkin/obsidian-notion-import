@@ -5,6 +5,7 @@ Import entries from your Notion databases directly into Obsidian. This plugin al
 ## Features
 
 - Import entries from any Notion database
+- Multiple database ↔ folder mappings
 - Customizable file naming patterns
 - Configurable destination folder
 - Automatic syncing on a schedule
@@ -32,7 +33,9 @@ Import entries from your Notion databases directly into Obsidian. This plugin al
 5. Configure the plugin:
    - Open Obsidian settings
    - Go to the "Notion Importer" tab
-   - Enter your Notion token and database ID
+   - Enter your Notion token
+   - Under "Connections (Database ↔ Folder)", click "Add" to create one or more mappings
+   - For each mapping, set the Notion Database ID and the destination Obsidian folder
    - Configure other options as desired
 
 ## Usage
@@ -42,6 +45,12 @@ Click the database icon in the ribbon to import entries immediately.
 
 ### Automatic Import
 Enable "Auto Import" in settings and set your desired interval. The plugin will automatically check for updates and import new entries.
+
+### Multiple Databases
+- When one or more connections are configured, imports will run for each mapping sequentially (to respect Notion rate limits).
+- The destination folder for each mapping will be created automatically if it does not exist.
+- Manual imports and auto-imports apply to all configured mappings.
+- You can add, edit, or remove mappings in Settings → Notion Importer → Connections.
 
 ### Bidirectional Sync
 Enable "Bidirectional Sync" in the settings to:
