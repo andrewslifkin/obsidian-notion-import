@@ -22,6 +22,7 @@ interface NotionImporterSettings {
     templatePath: string;
     bidirectionalSync: boolean; // Enable syncing changes back to Notion
     failedSyncs: { file: string; timestamp: number; error: string }[];
+    connections?: { databaseId: string; destinationFolder: string }[]; // Multi-database support
 }
 
 const DEFAULT_SETTINGS: NotionImporterSettings = {
@@ -39,7 +40,8 @@ const DEFAULT_SETTINGS: NotionImporterSettings = {
     useTemplate: false,
     templatePath: '',
     bidirectionalSync: false,
-    failedSyncs: []
+    failedSyncs: [],
+    connections: []
 }
 
 export default class NotionImporterPlugin extends Plugin {
@@ -51,11 +53,20 @@ export default class NotionImporterPlugin extends Plugin {
     private isTwoWaySyncRunning: boolean = false;
     private syncingFiles: Set<string> = new Set();
 
+    private getActiveConnections(): { databaseId: string; destinationFolder: string }[] {
+        const conns = this.settings.connections ?? [];
+        if (conns.length > 0) return conns.filter(c => c.databaseId && c.destinationFolder);
+        if (this.settings.databaseId && this.settings.destinationFolder) {
+            return [{ databaseId: this.settings.databaseId, destinationFolder: this.settings.destinationFolder }];
+        }
+        return [];
+    }
+
     async onload() {
         await this.loadSettings();
         
         // Add settings tab
-        this.addSettingTab(new NotionImporterSettingTab(this.app, this));
+        this.addSettingTab(new NotionImporterSettingTab(this.app, this as any));
 
         // Add styles for the diff view
         this.addStyles();
@@ -121,8 +132,9 @@ export default class NotionImporterPlugin extends Plugin {
                 if (!this.settings.bidirectionalSync) {
                     return;
                 }
-                // Only sync files inside the configured destination folder
-                if (!pathIsWithinFolder(file.path, this.settings.destinationFolder)) {
+                // Only sync files inside any configured destination folders
+                const folders = this.getActiveConnections().map(c => c.destinationFolder);
+                if (!folders.some(folder => pathIsWithinFolder(file.path, folder))) {
                     return;
                 }
                 
@@ -322,7 +334,7 @@ export default class NotionImporterPlugin extends Plugin {
                 
                 // Check for conflicts - compare local last edited time with Notion's last edited time
                 if (localLastEditedTime && 'last_edited_time' in page) {
-                    const notionLastEditedTime = page.last_edited_time;
+                    const notionLastEditedTime = (page as any).last_edited_time as string;
                     
                     console.log(`Comparing edit times - Local: ${localLastEditedTime}, Notion: ${notionLastEditedTime}`);
                     
@@ -388,13 +400,17 @@ export default class NotionImporterPlugin extends Plugin {
         try {
             console.log("Starting sync of local changes to Notion");
             
+            // Determine allowed folders
+            const folders = this.getActiveConnections().map(c => c.destinationFolder);
+            if (folders.length === 0) return;
+            
             // Get all markdown files
             const files = this.app.vault.getMarkdownFiles();
             let syncedCount = 0;
             
             for (const file of files) {
-                // Only consider files within the destination folder
-                if (!pathIsWithinFolder(file.path, this.settings.destinationFolder)) {
+                // Only consider files within any destination folder
+                if (!folders.some(folder => pathIsWithinFolder(file.path, folder))) {
                     continue;
                 }
                 // Skip files without a Notion page ID
@@ -444,48 +460,51 @@ export default class NotionImporterPlugin extends Plugin {
                 this.isImportRunning = false;
                 return;
             }
-            if (!this.settings.databaseId) {
-                new Notice('Please set your Notion database ID in settings');
+            const connections = this.getActiveConnections();
+            if (connections.length === 0) {
+                new Notice('Please configure at least one Notion database ↔ folder mapping in settings');
                 this.isImportRunning = false;
                 return;
             }
 
-            // Ensure destination folder exists
-            await this.ensureFolderExists(this.settings.destinationFolder);
+            // Ensure destination folders exist
+            for (const conn of connections) {
+                await this.ensureFolderExists(conn.destinationFolder);
+            }
 
-            // Test database access
-            try {
-                console.log('Testing database access with ID:', this.settings.databaseId);
-                await withRetry(() => this.notionClient.databases.retrieve({
-                    database_id: this.settings.databaseId,
-                }));
-            } catch (error: any) {
-                console.error('Database access error:', error);
-                if (error.status === 404) {
-                    new Notice(`Database not found (404). ID: ${this.settings.databaseId}. Please check your database ID and make sure the integration has access to it.`);
-                } else if (error.status === 401) {
-                    new Notice('Invalid integration token (401). Please check your Notion integration token.');
-                } else {
-                    new Notice(`Error accessing database: ${error.message}`);
+            // Validate each database
+            for (const conn of connections) {
+                try {
+                    console.log('Testing database access with ID:', conn.databaseId);
+                    await withRetry(() => this.notionClient.databases.retrieve({
+                        database_id: conn.databaseId,
+                    }));
+                } catch (error: any) {
+                    console.error('Database access error:', error);
+                    new Notice(`Error accessing database ${conn.databaseId}: ${error.message}`);
+                    // continue to next mapping
                 }
-                this.isImportRunning = false;
-                return;
             }
 
-            const count = await importDatabase({
-                notion: this.notionClient,
-                destinationFolder: this.settings.destinationFolder,
-                appVault: {
-                    ensureFolderExists: (p: string) => this.ensureFolderExists(p),
-                    findFileByNotionPageId: (pageId: string) => this.findFileByNotionPageId(pageId),
-                    generateFileName: (title: string, created?: string) => this.generateFileName(title, created),
-                    read: (file: TFile) => this.app.vault.read(file),
-                    create: (path: string, content: string) => this.app.vault.create(path, content),
-                    modify: (file: TFile, content: string) => this.app.vault.modify(file, content),
-                },
-                getPageContent: (pageId: string) => this.getPageContent(pageId),
-            }, this.settings.databaseId);
-            if (count > 0) new Notice(`Imported/updated ${count} notes from Notion`);
+            // Run imports sequentially to avoid rate limits
+            let total = 0;
+            for (const conn of connections) {
+                const count = await importDatabase({
+                    notion: this.notionClient,
+                    destinationFolder: conn.destinationFolder,
+                    appVault: {
+                        ensureFolderExists: (p: string) => this.ensureFolderExists(p),
+                        findFileByNotionPageId: (pageId: string) => this.findFileByNotionPageId(pageId),
+                        generateFileName: (title: string, created?: string) => this.generateFileName(title, created),
+                        read: (file: TFile) => this.app.vault.read(file),
+                        create: (path: string, content: string) => this.app.vault.create(path, content),
+                        modify: (file: TFile, content: string) => this.app.vault.modify(file, content),
+                    },
+                    getPageContent: (pageId: string) => this.getPageContent(pageId),
+                }, conn.databaseId);
+                total += count;
+            }
+            if (total > 0) new Notice(`Imported/updated ${total} notes from Notion`);
             this.isImportRunning = false;
         } catch (error: any) {
             console.error('Error importing from Notion:', error);
@@ -558,28 +577,28 @@ export default class NotionImporterPlugin extends Plugin {
             // Add required frontmatter fields
             frontmatterFields['imported_from'] = 'notion';
             frontmatterFields['notion_page_id'] = pageId;
-            frontmatterFields['last_edited_time'] = page.last_edited_time;
+            frontmatterFields['last_edited_time'] = (page as any).last_edited_time as string;
             
             // Add title to frontmatter for Auto Note Mover
-            for (const [key, prop] of Object.entries(page.properties)) {
-                if (prop.type === 'title' && prop.title.length > 0) {
-                    const value = prop.title.map((t: any) => t.plain_text).join('');
+            for (const [key, prop] of Object.entries((page as any).properties)) {
+                if ((prop as any).type === 'title' && (prop as any).title.length > 0) {
+                    const value = (prop as any).title.map((t: any) => t.plain_text).join('');
                     frontmatterFields['title'] = value;
                     break;
                 }
             }
             
             // Add other properties
-            for (const [key, prop] of Object.entries(page.properties)) {
-                if (prop.type === 'title') continue; // Skip title as we already added it
+            for (const [key, prop] of Object.entries((page as any).properties)) {
+                if ((prop as any).type === 'title') continue; // Skip title as we already added it
                 
                 // Escape special characters in property keys
                 const safeKey = key.replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase();
                 
-                if (prop.type === 'date' && prop.date) {
-                    frontmatterFields[safeKey] = prop.date.start;
-                } else if (prop.type === 'rich_text' && prop.rich_text.length > 0) {
-                    const value = prop.rich_text.map((t: any) => t.plain_text).join('');
+                if ((prop as any).type === 'date' && (prop as any).date) {
+                    frontmatterFields[safeKey] = (prop as any).date.start;
+                } else if ((prop as any).type === 'rich_text' && (prop as any).rich_text.length > 0) {
+                    const value = (prop as any).rich_text.map((t: any) => t.plain_text).join('');
                     frontmatterFields[safeKey] = value;
                 }
             }
@@ -589,7 +608,7 @@ export default class NotionImporterPlugin extends Plugin {
             for (const [key, value] of Object.entries(frontmatterFields)) {
                 // Properly quote values that need it
                 const needsQuotes = value.includes('\n') || value.includes('"') || value.includes("'") || value.includes(':');
-                const quotedValue = needsQuotes ? `"${value.replace(/"/g, '\\"')}"` : value;
+                const quotedValue = needsQuotes ? `"${value.replace(/\"/g, '\\"')}"` : value;
                 content += `${key}: ${quotedValue}\n`;
             }
             content += '---\n\n';
@@ -610,9 +629,12 @@ export default class NotionImporterPlugin extends Plugin {
             
             // Get children blocks if they exist
             let children: any[] = [];
-            if ('has_children' in block && block.has_children) {
-                const childBlocks = await listAllChildBlocks(this.notionClient, block.id);
-                children = childBlocks;
+            if ('has_children' in block && (block as any).has_children) {
+                const childBlocks = await this.notionClient.blocks.children.list({
+                    block_id: (block as any).id,
+                    page_size: 100
+                });
+                children = childBlocks.results as any[];
             }
             
             const markdown = await this.blockToMarkdown(block as BlockObjectResponse, children);
@@ -651,9 +673,12 @@ export default class NotionImporterPlugin extends Plugin {
                 
                 // Get nested children
                 let nestedChildren: any[] = [];
-                if ('has_children' in child && child.has_children) {
-                    const nestedBlocks = await listAllChildBlocks(this.notionClient, child.id);
-                    nestedChildren = nestedBlocks;
+                if ('has_children' in child && (child as any).has_children) {
+                    const nestedBlocks = await this.notionClient.blocks.children.list({
+                        block_id: (child as any).id,
+                        page_size: 100
+                    });
+                    nestedChildren = nestedBlocks.results as any[];
                 }
                 
                 const childMarkdown = await this.blockToMarkdown(child as BlockObjectResponse, nestedChildren);
@@ -666,54 +691,43 @@ export default class NotionImporterPlugin extends Plugin {
         };
         
         let content = '';
-        switch (block.type) {
+        switch ((block as any).type) {
             case 'paragraph':
-                content = block.paragraph.rich_text.map((text: any) => text.plain_text).join('');
+                content = (block as any).paragraph.rich_text.map((text: any) => text.plain_text).join('');
                 break;
-            
             case 'heading_1':
-                content = `# ${block.heading_1.rich_text.map((text: any) => text.plain_text).join('')}`;
+                content = `# ${(block as any).heading_1.rich_text.map((text: any) => text.plain_text).join('')}`;
                 break;
-            
             case 'heading_2':
-                content = `## ${block.heading_2.rich_text.map((text: any) => text.plain_text).join('')}`;
+                content = `## ${(block as any).heading_2.rich_text.map((text: any) => text.plain_text).join('')}`;
                 break;
-            
             case 'heading_3':
-                content = `### ${block.heading_3.rich_text.map((text: any) => text.plain_text).join('')}`;
+                content = `### ${(block as any).heading_3.rich_text.map((text: any) => text.plain_text).join('')}`;
                 break;
-            
             case 'bulleted_list_item':
-                content = `- ${block.bulleted_list_item.rich_text.map((text: any) => text.plain_text).join('')}`;
+                content = `- ${(block as any).bulleted_list_item.rich_text.map((text: any) => text.plain_text).join('')}`;
                 break;
-            
             case 'numbered_list_item':
-                content = `1. ${block.numbered_list_item.rich_text.map((text: any) => text.plain_text).join('')}`;
+                content = `1. ${(block as any).numbered_list_item.rich_text.map((text: any) => text.plain_text).join('')}`;
                 break;
-            
             case 'to_do':
-                const checked = block.to_do.checked ? 'x' : ' ';
-                content = `- [${checked}] ${block.to_do.rich_text.map((text: any) => text.plain_text).join('')}`;
+                const checked = (block as any).to_do.checked ? 'x' : ' ';
+                content = `- [${checked}] ${(block as any).to_do.rich_text.map((text: any) => text.plain_text).join('')}`;
                 break;
-            
             case 'toggle':
-                content = `- ${block.toggle.rich_text.map((text: any) => text.plain_text).join('')}`;
+                content = `- ${(block as any).toggle.rich_text.map((text: any) => text.plain_text).join('')}`;
                 break;
-            
             case 'code':
-                content = `\`\`\`${block.code.language}\n${block.code.rich_text.map((text: any) => text.plain_text).join('')}\n\`\`\``;
+                content = `\`\`\`${(block as any).code.language}\n${(block as any).code.rich_text.map((text: any) => text.plain_text).join('')}\n\`\`\``;
                 break;
-            
             case 'quote':
-                content = `> ${block.quote.rich_text.map((text: any) => text.plain_text).join('')}`;
+                content = `> ${(block as any).quote.rich_text.map((text: any) => text.plain_text).join('')}`;
                 break;
-            
             case 'divider':
                 content = '---';
                 break;
-            
             default:
-                console.log('Unhandled block type:', block.type);
+                console.log('Unhandled block type:', (block as any).type);
                 return '';
         }
 
@@ -738,8 +752,8 @@ export default class NotionImporterPlugin extends Plugin {
 
         if (this.settings.includeDateInFilename) {
             const dateStr = this.settings.dateSource === 'created' && createdDate ? 
-                moment(createdDate).format(this.settings.dateFormat) : 
-                moment().format(this.settings.dateFormat);
+                (moment as any)(createdDate).format(this.settings.dateFormat) : 
+                (moment as any)().format(this.settings.dateFormat);
 
             fileName = this.settings.datePosition === 'prefix' 
                 ? `${dateStr}${this.settings.dateSeparator}${fileName}`
@@ -759,10 +773,10 @@ export default class NotionImporterPlugin extends Plugin {
         const minutes = this.settings.importInterval;
         console.log(`Setting up auto-import every ${minutes} minutes`);
         
-        this.importInterval = window.setInterval(() => {
+        this.importInterval = window.setInterval(async () => {
             console.log('Auto-importing from Notion');
             if (!this.isImportRunning && !this.isTwoWaySyncRunning) {
-                this.importFromNotion();
+                await this.importFromNotion();
             } else {
                 console.log('Skipping auto-import; another sync is running');
             }
@@ -771,7 +785,7 @@ export default class NotionImporterPlugin extends Plugin {
             if (this.settings.bidirectionalSync) {
                 console.log('Syncing local changes to Notion');
                 if (!this.isTwoWaySyncRunning) {
-                    this.syncLocalChangesToNotion();
+                    await this.syncLocalChangesToNotion();
                 } else {
                     console.log('Skipping local sync; another sync is running');
                 }
