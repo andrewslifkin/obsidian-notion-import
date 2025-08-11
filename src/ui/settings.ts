@@ -15,6 +15,7 @@ export interface NotionImporterSettings {
   useTemplate: boolean;
   templatePath: string;
   bidirectionalSync: boolean;
+  connections?: { databaseId: string; destinationFolder: string }[];
 }
 
 export interface NotionImporterLike {
@@ -34,9 +35,21 @@ export class NotionImporterSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
-  display(): void {
+  async display() {
     const { containerEl } = this;
     containerEl.empty();
+
+    // Migrate legacy single mapping into connections list (one-time, non-destructive)
+    if (!this.plugin.settings.connections || this.plugin.settings.connections.length === 0) {
+      this.plugin.settings.connections = [];
+      if (this.plugin.settings.databaseId && this.plugin.settings.destinationFolder) {
+        this.plugin.settings.connections.push({
+          databaseId: this.plugin.settings.databaseId,
+          destinationFolder: this.plugin.settings.destinationFolder,
+        });
+        await this.plugin.saveSettings();
+      }
+    }
 
     containerEl.createEl('h2', { text: 'Notion Importer Settings' });
 
@@ -53,15 +66,82 @@ export class NotionImporterSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    new Setting(containerEl)
-      .setName('Database ID')
-      .setDesc('The ID of your Notion database')
-      .addText(text => text
-        .setValue(this.plugin.settings.databaseId)
-        .onChange(async (value) => {
-          this.plugin.settings.databaseId = value;
-          await this.plugin.saveSettings();
-        }));
+    // Multi-database mappings
+    containerEl.createEl('h3', { text: 'Connections (Database ↔ Folder)' });
+
+    const connectionsWrapper = containerEl.createDiv({ cls: 'connections-wrapper' });
+
+    const renderConnections = () => {
+      connectionsWrapper.empty();
+
+      const conns = this.plugin.settings.connections ?? [];
+      if (conns.length === 0) {
+        const empty = connectionsWrapper.createDiv({ cls: 'setting-item-description' });
+        empty.setText('No connections configured. Add one below.');
+      }
+
+      conns.forEach((conn, idx) => {
+        const row = new Setting(connectionsWrapper)
+          .setName(`Mapping ${idx + 1}`)
+          .setDesc('Notion Database ID ↔ Obsidian Folder');
+
+        row.addText((t: TextComponent) => {
+          t.setPlaceholder('Notion Database ID')
+            .setValue(conn.databaseId)
+            .onChange(async (val) => {
+              this.plugin.settings.connections![idx].databaseId = val.trim();
+              await this.plugin.saveSettings();
+            });
+        });
+
+        row.addText((t: TextComponent) => {
+          t.setPlaceholder('Folder (e.g., Notes/Notion)')
+            .setValue(conn.destinationFolder)
+            .onChange(async (val) => {
+              this.plugin.settings.connections![idx].destinationFolder = val.trim();
+              await this.plugin.saveSettings();
+            });
+
+          // Folder suggestions
+          const folders = this.app.vault.getAllLoadedFiles()
+            .filter((f): f is TFolder => f instanceof TFolder)
+            .map(f => f.path);
+          const focusListener = () => {
+            const modal = new FolderSuggestModal(this.app, t, folders);
+            modal.open();
+          };
+          (t.inputEl as any)._folderSuggestListener = focusListener;
+          t.inputEl.addEventListener('focus', focusListener);
+        });
+
+        row.addExtraButton(btn => {
+          btn.setIcon('trash')
+            .setTooltip('Remove mapping')
+            .onClick(async () => {
+              this.plugin.settings.connections!.splice(idx, 1);
+              await this.plugin.saveSettings();
+              renderConnections();
+            });
+        });
+      });
+
+      const addRow = new Setting(connectionsWrapper)
+        .setName('Add connection')
+        .setDesc('Create a new mapping from a Notion database to a destination folder');
+
+      addRow.addButton(btn => {
+        btn.setButtonText('Add')
+          .setCta()
+          .onClick(async () => {
+            this.plugin.settings.connections = this.plugin.settings.connections ?? [];
+            this.plugin.settings.connections.push({ databaseId: '', destinationFolder: '' });
+            await this.plugin.saveSettings();
+            renderConnections();
+          });
+      });
+    };
+
+    renderConnections();
 
     // File Settings
     containerEl.createEl('h3', { text: 'File Settings' });
@@ -72,30 +152,6 @@ export class NotionImporterSettingTab extends PluginSettingTab {
       text: 'Preview: '
     });
     this.updatePreview();
-
-    new Setting(containerEl)
-      .setName('Destination Folder')
-      .setDesc('Folder where imported files will be saved')
-      .addText((text: TextComponent) => {
-        text
-          .setPlaceholder('Example: folder/subfolder')
-          .setValue(this.plugin.settings.destinationFolder)
-          .onChange(async (value) => {
-            this.plugin.settings.destinationFolder = value;
-            await this.plugin.saveSettings();
-          });
-
-        const folders = this.app.vault.getAllLoadedFiles()
-          .filter((f): f is TFolder => f instanceof TFolder)
-          .map(f => f.path);
-
-        const focusListener = () => {
-          const modal = new FolderSuggestModal(this.app, text, folders);
-          modal.open();
-        };
-        (text.inputEl as any)._folderSuggestListener = focusListener;
-        text.inputEl.addEventListener('focus', focusListener);
-      });
 
     new Setting(containerEl)
       .setName('File Naming Pattern')
