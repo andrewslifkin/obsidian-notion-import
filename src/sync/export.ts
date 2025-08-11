@@ -1,6 +1,6 @@
 import { Notice, TFile } from 'obsidian';
 import type { Client } from '@notionhq/client';
-import { withRetry, listAllChildBlocks } from '../utils';
+import { withRetry, listAllChildBlocks, sleep } from '../utils';
 
 export interface ExportContext {
   notion: Client;
@@ -29,18 +29,21 @@ export async function syncFileToNotion(ctx: ExportContext, file: TFile, pageId: 
       },
     }));
 
-    // Clear existing blocks
+    // Clear existing blocks - sequential with pacing to respect rate limits
     const allBlocks = await listAllChildBlocks(ctx.notion, pageId);
-    const batchSize = 10;
-    for (let i = 0; i < allBlocks.length; i += batchSize) {
-      const batch = allBlocks.slice(i, i + batchSize);
-      await Promise.all(batch.map(b => withRetry(() => ctx.notion.blocks.delete({ block_id: b.id }))
-        .catch(err => console.error('Failed to delete block', b.id, err))));
-      if (i + batchSize < allBlocks.length) await new Promise(r => setTimeout(r, 500));
+    for (const b of allBlocks) {
+      try {
+        await withRetry(() => ctx.notion.blocks.delete({ block_id: b.id }));
+      } catch (err) {
+        console.error('Failed to delete block', b.id, err);
+      }
+      // Small delay between deletions to avoid 429s
+      await sleep(250);
     }
 
     // Append new blocks
     const blocks = ctx.markdownToBlocks(markdown);
+    const batchSize = 10;
     for (let i = 0; i < blocks.length; i += batchSize) {
       const batch = blocks.slice(i, i + batchSize);
       await withRetry(() => ctx.notion.blocks.children.append({ block_id: pageId, children: batch }));
