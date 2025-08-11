@@ -497,7 +497,7 @@ export default class NotionImporterPlugin extends Plugin {
                         findFileByNotionPageId: (pageId: string) => this.findFileByNotionPageId(pageId),
                         generateFileName: (title: string, created?: string) => this.generateFileName(title, created),
                         read: (file: TFile) => this.app.vault.read(file),
-                        create: (path: string, content: string) => this.app.vault.create(path, content),
+                        create: async (path: string, content: string) => { await this.app.vault.create(path, content); },
                         modify: (file: TFile, content: string) => this.app.vault.modify(file, content),
                     },
                     getPageContent: (pageId: string) => this.getPageContent(pageId),
@@ -527,7 +527,7 @@ export default class NotionImporterPlugin extends Plugin {
         while (nextCursor) {
             const moreBlocks = await withRetry(() => this.notionClient.blocks.children.list({
                 block_id: pageId,
-                start_cursor: nextCursor,
+                start_cursor: nextCursor ?? undefined,
                 page_size: 100
             }));
             allBlocks = [...allBlocks, ...moreBlocks.results];
