@@ -24,6 +24,8 @@ export interface NotionImporterLike {
   saveSettings(): Promise<void>;
   generateFileName(title: string, createdDate?: string): string;
   startAutoImport(): void;
+  importFromNotion(): Promise<void>;
+  syncLocalChangesToNotion(): Promise<void>;
 }
 
 export class NotionImporterSettingTab extends PluginSettingTab {
@@ -234,6 +236,28 @@ export class NotionImporterSettingTab extends PluginSettingTab {
           this.plugin.settings.bidirectionalSync = value;
           await this.plugin.saveSettings();
         }));
+
+    // Manual Sync Button
+    new Setting(containerEl)
+      .setName('Manual Sync')
+      .setDesc('Run a sync now. Imports from Notion; if Bidirectional Sync is enabled, also pushes local changes to Notion.')
+      .addButton(btn => {
+        btn.setButtonText('Sync Now').setCta();
+        btn.onClick(async () => {
+          btn.setDisabled(true);
+          const original = btn.buttonEl.textContent || 'Sync Now';
+          btn.setButtonText('Syncing...');
+          try {
+            await this.plugin.importFromNotion();
+            if (this.plugin.settings.bidirectionalSync) {
+              await this.plugin.syncLocalChangesToNotion();
+            }
+          } finally {
+            btn.setButtonText(original);
+            btn.setDisabled(false);
+          }
+        });
+      });
 
     // Auto Import Settings
     containerEl.createEl('h3', { text: 'Auto Import Settings' });
