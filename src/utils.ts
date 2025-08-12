@@ -15,9 +15,9 @@ export async function sleep(ms: number): Promise<void> {
 
 export async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
   const {
-    retries = 3,
-    baseDelayMs = 500,
-    maxDelayMs = 5000,
+    retries = 6,
+    baseDelayMs = 1000,
+    maxDelayMs = 15000,
     retryOn = (error: any) => {
       const status = error?.status ?? error?.response?.status;
       return status === 429 || (status >= 500 && status < 600);
@@ -34,8 +34,13 @@ export async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions =
       if (attempt > retries || !retryOn(error)) {
         throw error;
       }
+      const isRateLimited = (error as any)?.status === 429;
       const jitter = Math.random() * 0.25 + 0.75; // 0.75x - 1x
-      const delay = Math.min(maxDelayMs, Math.round(baseDelayMs * Math.pow(2, attempt - 1) * jitter));
+      let delay = Math.min(maxDelayMs, Math.round(baseDelayMs * Math.pow(2, attempt - 1) * jitter));
+      if (isRateLimited) {
+        // Respect rate limits with a longer floor when 429 is encountered
+        delay = Math.max(delay, 5000);
+      }
       console.warn(`Retrying after error (attempt ${attempt}/${retries}) in ${delay}ms`, error);
       await sleep(delay);
     }
