@@ -341,9 +341,45 @@ export default class NotionImporterPlugin extends Plugin {
                     // If Notion version is newer, we have a conflict
                     if (new Date(notionLastEditedTime) > new Date(localLastEditedTime)) {
                         console.log(`Conflict detected: Notion version is newer than local version`);
-                        // Ask user to resolve conflict
+                        // Ask user to resolve conflict with details about timestamps
                         const choice = await new Promise<'keep-local' | 'keep-notion' | 'cancel'>(resolve => {
-                            const modal = new ConflictResolutionModal(this.app, resolve);
+                            const modal = new Modal(this.app);
+                            const formatTime = (iso?: string | null): string => {
+                                if (!iso) return 'Unknown';
+                                try {
+                                    const m = moment(iso);
+                                    return `${m.format('YYYY-MM-DD HH:mm')} (${m.fromNow()})`;
+                                } catch {
+                                    return String(iso);
+                                }
+                            };
+                            modal.onOpen = () => {
+                                const { contentEl } = modal;
+                                contentEl.empty();
+                                contentEl.createEl('h2', { text: 'Conflict detected' });
+                                contentEl.createEl('p', { text: 'The Notion page has newer content than your local note. Choose which version to keep.' });
+
+                                const details = contentEl.createDiv({ cls: 'notion-conflict-details' });
+                                const list = details.createEl('ul');
+                                list.createEl('li', { text: `Notion last edited: ${formatTime(notionLastEditedTime)}` });
+                                list.createEl('li', { text: `Local last edited: ${formatTime(localLastEditedTime)}` });
+                                if (notionLastEditedTime && localLastEditedTime) {
+                                    const diffMs = new Date(notionLastEditedTime).getTime() - new Date(localLastEditedTime).getTime();
+                                    const absMins = Math.round(Math.abs(diffMs) / 60000);
+                                    const diffText = absMins < 1 ? '<1 minute' : `${absMins} minute${absMins === 1 ? '' : 's'}`;
+                                    details.createEl('p', { text: `Notion is newer by approximately ${diffText}.` });
+                                }
+
+                                const buttonRow = contentEl.createDiv({ cls: 'modal-button-container' });
+                                const cancelBtn = buttonRow.createEl('button', { text: 'Cancel' });
+                                cancelBtn.addEventListener('click', () => { resolve('cancel'); modal.close(); });
+
+                                const keepNotionBtn = buttonRow.createEl('button', { text: 'Keep Notion' });
+                                keepNotionBtn.addEventListener('click', () => { resolve('keep-notion'); modal.close(); });
+
+                                const keepLocalBtn = buttonRow.createEl('button', { text: 'Keep Local' });
+                                keepLocalBtn.addEventListener('click', () => { resolve('keep-local'); modal.close(); });
+                            };
                             modal.open();
                         });
                         if (choice === 'cancel') {
