@@ -202,7 +202,15 @@ export default class NotionImporterPlugin extends Plugin {
                         errorMessage = 'Rate Limited (429): Too many requests to Notion API';
                     }
                     
-                    throw new Error(errorMessage);
+                    const err: any = new Error(errorMessage);
+                    // Attach status so upstream withRetry can detect and backoff/retry
+                    err.status = response.status;
+                    err.response = {
+                        status: response.status,
+                        json: response.json,
+                        text: response.text,
+                    };
+                    throw err;
                 }
                 
                 return {
