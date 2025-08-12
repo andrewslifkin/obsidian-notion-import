@@ -2,6 +2,8 @@ import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Set
 import { Client } from '@notionhq/client';
 import { PageObjectResponse, BlockObjectResponse } from '@notionhq/client/build/src/api-endpoints';
 import { withRetry, listAllChildBlocks, getNotionPageIdFromContent, getLastEditedTimeFromContent, setLastEditedTimeInContent, parseTitleFromFrontmatter, pathIsWithinFolder, ConflictResolutionModal, markdownToBlocks } from './src/utils';
+import { OptimizedSyncManager } from './src/optimized-sync';
+import { NotionRateLimiter } from './src/rate-limiter';
 import { NotionImporterSettingTab } from './src/ui/settings';
 import { importDatabase } from './src/sync/import';
 import { syncFileToNotion as exportSyncFileToNotion } from './src/sync/export';
@@ -52,6 +54,8 @@ export default class NotionImporterPlugin extends Plugin {
     private isImportRunning: boolean = false;
     private isTwoWaySyncRunning: boolean = false;
     private syncingFiles: Set<string> = new Set();
+    private syncManager: OptimizedSyncManager | null = null;
+    private rateLimiter: NotionRateLimiter | null = null;
 
     private getActiveConnections(): { databaseId: string; destinationFolder: string }[] {
         const conns = this.settings.connections ?? [];
@@ -116,6 +120,27 @@ export default class NotionImporterPlugin extends Plugin {
                     await this.syncLocalChangesToNotion();
                 } finally {
                     this.isTwoWaySyncRunning = false;
+                }
+            }
+        });
+
+        // Add sync status command
+        this.addCommand({
+            id: 'notion-importer-sync-status',
+            name: 'Show Sync Status',
+            callback: () => {
+                if (this.syncManager && this.rateLimiter) {
+                    const status = this.syncManager.getStatus();
+                    const message = [
+                        `Sync Queue: ${status.queueLength} operations`,
+                        `Active Syncs: ${status.activeSyncs}`,
+                        `Rate Limiter Queue: ${status.rateLimiterStatus.queueLength}`,
+                        `Available Tokens: ${status.rateLimiterStatus.tokens.toFixed(1)}`,
+                        `Consecutive 429s: ${status.rateLimiterStatus.consecutive429s}`
+                    ].join('\n');
+                    new Notice(message, 5000);
+                } else {
+                    new Notice('Sync system not initialized');
                 }
             }
         });
@@ -242,10 +267,29 @@ export default class NotionImporterPlugin extends Plugin {
             fetch: customFetch as any
         });
 
+        // Initialize optimized sync manager
+        this.initializeSyncManager();
+
         // Setup auto-import if enabled
         if (this.settings.autoImport) {
             this.startAutoImport();
         }
+    }
+
+    private initializeSyncManager() {
+        this.rateLimiter = new NotionRateLimiter({
+            requestsPerSecond: 2.5,
+            burstSize: 5,
+            adaptiveBackoff: true
+        });
+
+        this.syncManager = new OptimizedSyncManager({
+            notion: this.notionClient,
+            read: (file: TFile) => this.app.vault.read(file),
+            modify: (file: TFile, content: string) => this.app.vault.modify(file, content),
+            updateLastEditedTimeInFile: (file: TFile, time: string) => this.updateLastEditedTimeInFile(file, time),
+            getPageContent: (pageId: string) => this.getPageContent(pageId)
+        });
     }
 
     async loadSettings() {
@@ -316,29 +360,25 @@ export default class NotionImporterPlugin extends Plugin {
 
     async syncFileToNotion(file: TFile): Promise<boolean> {
         try {
-            console.log(`Syncing file to Notion: ${file.path}`);
-            if (this.syncingFiles.has(file.path)) {
-                console.log('Sync already in progress for file, skipping:', file.path);
-                return false;
-            }
-            this.syncingFiles.add(file.path);
+            console.log(`Starting optimized sync for file: ${file.path}`);
             
             // Get the Notion page ID from frontmatter
             const pageId = await this.getNotionPageIdFromFile(file);
             if (!pageId) {
                 console.log(`No Notion page ID found in file: ${file.path}`);
-                this.syncingFiles.delete(file.path);
                 return false;
             }
             
             console.log(`Found Notion page ID: ${pageId} for file: ${file.path}`);
             
-            // Get the last edited time from the frontmatter
+            // Get the last edited time from the frontmatter for conflict detection
             const localLastEditedTime = await this.getLastEditedTimeFromFile(file);
             
-            // Check if the page still exists in Notion
+            // Check for conflicts first
             try {
-                const page = await withRetry(() => this.notionClient.pages.retrieve({ page_id: pageId }));
+                const page = await this.rateLimiter!.execute(() => 
+                    this.notionClient.pages.retrieve({ page_id: pageId }), 2
+                );
                 
                 // Check for conflicts - compare local last edited time with Notion's last edited time
                 if (localLastEditedTime && 'last_edited_time' in page) {
@@ -391,37 +431,37 @@ export default class NotionImporterPlugin extends Plugin {
                             modal.open();
                         });
                         if (choice === 'cancel') {
-                            this.syncingFiles.delete(file.path);
                             return false;
                         } else if (choice === 'keep-notion') {
                             // Overwrite local from Notion
                             const content = await this.getPageContent(pageId);
                             await this.app.vault.modify(file, content);
-                            this.syncingFiles.delete(file.path);
                             return true;
                         }
+                        // If 'keep-local', continue with the sync
                     }
                 }
                 
-                // Update the page in Notion
-                const ok = await this.syncFileToNotionImpl(file, pageId);
-                this.syncingFiles.delete(file.path);
-                return ok;
+                // Use optimized sync manager for the actual sync
+                if (this.syncManager) {
+                    return await this.syncManager.optimizedExportSync(file, pageId);
+                } else {
+                    // Fallback to traditional sync if manager not initialized
+                    return await this.syncFileToNotionImpl(file, pageId);
+                }
                 
             } catch (error: any) {
-                console.error(`Error retrieving Notion page: ${error.message}`);
+                console.error(`Error during optimized sync: ${error.message}`);
                 if (error.status === 404) {
                     new Notice(`Notion page not found for ${file.basename}. It may have been deleted.`);
                 } else {
                     new Notice(`Error syncing to Notion: ${error.message}`);
                 }
-                this.syncingFiles.delete(file.path);
                 return false;
             }
         } catch (error: any) {
             console.error(`Error syncing file to Notion: ${error.message}`);
             new Notice(`Error syncing ${file.basename} to Notion: ${error.message}`);
-            this.syncingFiles.delete(file.path);
             return false;
         }
     }
@@ -516,13 +556,19 @@ export default class NotionImporterPlugin extends Plugin {
                 await this.ensureFolderExists(conn.destinationFolder);
             }
 
-            // Validate each database
+            // Validate each database using rate limiter
             for (const conn of connections) {
                 try {
                     console.log('Testing database access with ID:', conn.databaseId);
-                    await withRetry(() => this.notionClient.databases.retrieve({
-                        database_id: conn.databaseId,
-                    }));
+                    if (this.rateLimiter) {
+                        await this.rateLimiter.execute(() => this.notionClient.databases.retrieve({
+                            database_id: conn.databaseId,
+                        }), 2);
+                    } else {
+                        await withRetry(() => this.notionClient.databases.retrieve({
+                            database_id: conn.databaseId,
+                        }));
+                    }
                 } catch (error: any) {
                     console.error('Database access error:', error);
                     new Notice(`Error accessing database ${conn.databaseId}: ${error.message}`);

@@ -37,8 +37,8 @@ export async function syncFileToNotion(ctx: ExportContext, file: TFile, pageId: 
       } catch (err) {
         console.error('Failed to delete block', b.id, err);
       }
-      // Small delay between deletions to avoid 429s
-      await sleep(250);
+      // Pacing between deletions to stay below Notion's ~3 req/sec limit
+      await sleep(400);
     }
 
     // Append new blocks
