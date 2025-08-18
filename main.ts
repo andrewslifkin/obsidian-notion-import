@@ -2,6 +2,7 @@ import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Set
 import { Client } from '@notionhq/client';
 import { PageObjectResponse, BlockObjectResponse } from '@notionhq/client/build/src/api-endpoints';
 import { withRetry, listAllChildBlocks, getNotionPageIdFromContent, getLastEditedTimeFromContent, setLastEditedTimeInContent, parseTitleFromFrontmatter, pathIsWithinFolder, ConflictResolutionModal, markdownToBlocks } from './src/utils';
+import { ContentDiffer } from './src/content-diff';
 import { OptimizedSyncManager } from './src/optimized-sync';
 import { NotionRateLimiter } from './src/rate-limiter';
 import { NotionImporterSettingTab } from './src/ui/settings';
@@ -25,6 +26,8 @@ interface NotionImporterSettings {
     bidirectionalSync: boolean; // Enable syncing changes back to Notion
     failedSyncs: { file: string; timestamp: number; error: string }[];
     connections?: { databaseId: string; destinationFolder: string }[]; // Multi-database support
+    // Conflict detection
+    detectContentConflicts?: boolean; // If true, compare actual content (title + body) with Notion before exporting
 }
 
 const DEFAULT_SETTINGS: NotionImporterSettings = {
@@ -43,7 +46,8 @@ const DEFAULT_SETTINGS: NotionImporterSettings = {
     templatePath: '',
     bidirectionalSync: false,
     failedSyncs: [],
-    connections: []
+    connections: [],
+    detectContentConflicts: true
 }
 
 export default class NotionImporterPlugin extends Plugin {
@@ -371,60 +375,37 @@ export default class NotionImporterPlugin extends Plugin {
             
             console.log(`Found Notion page ID: ${pageId} for file: ${file.path}`);
             
-            // Get the last edited time from the frontmatter for conflict detection
-            const localLastEditedTime = await this.getLastEditedTimeFromFile(file);
-            
-            // Check for conflicts first
+            // Content-based conflict detection (optional)
             try {
                 const page = await this.rateLimiter!.execute(() => 
                     this.notionClient.pages.retrieve({ page_id: pageId }), 2
                 );
                 
-                // Check for conflicts - compare local last edited time with Notion's last edited time
-                if (localLastEditedTime && 'last_edited_time' in page) {
-                    const notionLastEditedTime = (page as any).last_edited_time as string;
-                    
-                    console.log(`Comparing edit times - Local: ${localLastEditedTime}, Notion: ${notionLastEditedTime}`);
-                    
-                    // If Notion version is newer, we have a conflict
-                    if (new Date(notionLastEditedTime) > new Date(localLastEditedTime)) {
-                        console.log(`Conflict detected: Notion version is newer than local version`);
-                        // Ask user to resolve conflict with details about timestamps
+                if (this.settings.detectContentConflicts !== false) {
+                    // Read local content and derive markdown + title
+                    const localContent = await this.app.vault.read(file);
+                    const parts = localContent.split(/^---\n([\s\S]*?)\n---\n/);
+                    const localMarkdown = parts.length >= 3 ? parts[2] : localContent;
+                    const localTitle = (localContent.match(/title:\s*["]?([^"'\n]+)["']?/) || [])[1] || file.basename;
+
+                    // Compare against current Notion content using structural diff
+                    const differ = new ContentDiffer(this.notionClient);
+                    const contentDiff = await differ.diffPageContent(pageId, localMarkdown, localTitle);
+
+                    if (contentDiff.hasChanges) {
+                        console.log(`Content conflict detected: Notion page content differs from local note`);
                         const choice = await new Promise<'keep-local' | 'keep-notion' | 'cancel'>(resolve => {
                             const modal = new Modal(this.app);
-                            const formatTime = (iso?: string | null): string => {
-                                if (!iso) return 'Unknown';
-                                try {
-                                    const m = moment(iso);
-                                    return `${m.format('YYYY-MM-DD HH:mm')} (${m.fromNow()})`;
-                                } catch {
-                                    return String(iso);
-                                }
-                            };
                             modal.onOpen = () => {
                                 const { contentEl } = modal;
                                 contentEl.empty();
-                                contentEl.createEl('h2', { text: 'Conflict detected' });
-                                contentEl.createEl('p', { text: 'The Notion page has newer content than your local note. Choose which version to keep.' });
-
-                                const details = contentEl.createDiv({ cls: 'notion-conflict-details' });
-                                const list = details.createEl('ul');
-                                list.createEl('li', { text: `Notion last edited: ${formatTime(notionLastEditedTime)}` });
-                                list.createEl('li', { text: `Local last edited: ${formatTime(localLastEditedTime)}` });
-                                if (notionLastEditedTime && localLastEditedTime) {
-                                    const diffMs = new Date(notionLastEditedTime).getTime() - new Date(localLastEditedTime).getTime();
-                                    const absMins = Math.round(Math.abs(diffMs) / 60000);
-                                    const diffText = absMins < 1 ? '<1 minute' : `${absMins} minute${absMins === 1 ? '' : 's'}`;
-                                    details.createEl('p', { text: `Notion is newer by approximately ${diffText}.` });
-                                }
-
+                                contentEl.createEl('h2', { text: 'Content conflict detected' });
+                                contentEl.createEl('p', { text: 'The Notion page content differs from your local note. Choose which version to keep.' });
                                 const buttonRow = contentEl.createDiv({ cls: 'modal-button-container' });
                                 const cancelBtn = buttonRow.createEl('button', { text: 'Cancel' });
                                 cancelBtn.addEventListener('click', () => { resolve('cancel'); modal.close(); });
-
                                 const keepNotionBtn = buttonRow.createEl('button', { text: 'Keep Notion' });
                                 keepNotionBtn.addEventListener('click', () => { resolve('keep-notion'); modal.close(); });
-
                                 const keepLocalBtn = buttonRow.createEl('button', { text: 'Keep Local' });
                                 keepLocalBtn.addEventListener('click', () => { resolve('keep-local'); modal.close(); });
                             };
@@ -444,7 +425,8 @@ export default class NotionImporterPlugin extends Plugin {
                 
                 // Use optimized sync manager for the actual sync
                 if (this.syncManager) {
-                    return await this.syncManager.optimizedExportSync(file, pageId);
+                    const ok = await this.syncManager.optimizedExportSync(file, pageId);
+                    return ok;
                 } else {
                     // Fallback to traditional sync if manager not initialized
                     return await this.syncFileToNotionImpl(file, pageId);
