@@ -538,18 +538,25 @@ export default class NotionImporterPlugin extends Plugin {
                 await this.ensureFolderExists(conn.destinationFolder);
             }
 
-            // Validate each database using rate limiter
+            // Validate each database using rate limiter and collect titles
+            const dbMeta: Record<string, { title: string }> = {};
             for (const conn of connections) {
                 try {
                     console.log('Testing database access with ID:', conn.databaseId);
                     if (this.rateLimiter) {
-                        await this.rateLimiter.execute(() => this.notionClient.databases.retrieve({
+                        const res = await this.rateLimiter.execute(() => this.notionClient.databases.retrieve({
                             database_id: conn.databaseId,
                         }), 2);
+                        const titleParts = (res as any).title ?? [];
+                        const title = Array.isArray(titleParts) ? titleParts.map((t: any) => t?.plain_text ?? '').join('') : '';
+                        dbMeta[conn.databaseId] = { title: title || conn.databaseId };
                     } else {
-                        await withRetry(() => this.notionClient.databases.retrieve({
+                        const res = await withRetry(() => this.notionClient.databases.retrieve({
                             database_id: conn.databaseId,
                         }));
+                        const titleParts = (res as any).title ?? [];
+                        const title = Array.isArray(titleParts) ? titleParts.map((t: any) => t?.plain_text ?? '').join('') : '';
+                        dbMeta[conn.databaseId] = { title: title || conn.databaseId };
                     }
                 } catch (error: any) {
                     console.error('Database access error:', error);
@@ -560,23 +567,34 @@ export default class NotionImporterPlugin extends Plugin {
 
             // Run imports sequentially to avoid rate limits
             let total = 0;
+            const perDbSummaries: string[] = [];
             for (const conn of connections) {
-                const count = await importDatabase({
-                    notion: this.notionClient,
-                    destinationFolder: conn.destinationFolder,
-                    appVault: {
-                        ensureFolderExists: (p: string) => this.ensureFolderExists(p),
-                        findFileByNotionPageId: (pageId: string) => this.findFileByNotionPageId(pageId),
-                        generateFileName: (title: string, created?: string) => this.generateFileName(title, created),
-                        read: (file: TFile) => this.app.vault.read(file),
-                        create: async (path: string, content: string) => { await this.app.vault.create(path, content); },
-                        modify: (file: TFile, content: string) => this.app.vault.modify(file, content),
-                    },
-                    getPageContent: (pageId: string) => this.getPageContent(pageId),
-                }, conn.databaseId);
-                total += count;
+                try {
+                    const count = await importDatabase({
+                        notion: this.notionClient,
+                        destinationFolder: conn.destinationFolder,
+                        appVault: {
+                            ensureFolderExists: (p: string) => this.ensureFolderExists(p),
+                            findFileByNotionPageId: (pageId: string) => this.findFileByNotionPageId(pageId),
+                            generateFileName: (title: string, created?: string) => this.generateFileName(title, created),
+                            read: (file: TFile) => this.app.vault.read(file),
+                            create: async (path: string, content: string) => { await this.app.vault.create(path, content); },
+                            modify: (file: TFile, content: string) => this.app.vault.modify(file, content),
+                        },
+                        getPageContent: (pageId: string) => this.getPageContent(pageId),
+                        execute: <T>(fn: () => Promise<T>, priority: number = 1) => this.rateLimiter ? this.rateLimiter.execute(fn, priority) : withRetry(fn),
+                    }, conn.databaseId);
+                    total += count;
+                    const title = dbMeta[conn.databaseId]?.title ?? conn.databaseId;
+                    perDbSummaries.push(`${title} → ${conn.destinationFolder}: ${count}`);
+                } catch (e: any) {
+                    const title = dbMeta[conn.databaseId]?.title ?? conn.databaseId;
+                    perDbSummaries.push(`${title} → ${conn.destinationFolder}: error (${e?.message || e})`);
+                }
             }
-            if (total > 0) new Notice(`Imported/updated ${total} notes from Notion`);
+            if (perDbSummaries.length > 0) {
+                new Notice(`Notion import summary:\n${perDbSummaries.join('\n')}`);
+            }
             this.isImportRunning = false;
         } catch (error: any) {
             console.error('Error importing from Notion:', error);

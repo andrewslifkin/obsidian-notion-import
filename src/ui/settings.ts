@@ -1,4 +1,5 @@
-import { App, PluginSettingTab, Setting, SuggestModal, TextComponent, TFolder, TFile } from 'obsidian';
+import { App, PluginSettingTab, Setting, SuggestModal, TextComponent, TFolder, TFile, Notice } from 'obsidian';
+import { notionSearchDatabases, testNotionAuth } from '../notion';
 
 export interface NotionImporterSettings {
   notionToken: string;
@@ -72,6 +73,46 @@ export class NotionImporterSettingTab extends PluginSettingTab {
     containerEl.createEl('h3', { text: 'Connections (Database ↔ Folder)' });
 
     const connectionsWrapper = containerEl.createDiv({ cls: 'connections-wrapper' });
+
+    // Controls row for picking from Notion and testing auth
+    const controls = new Setting(containerEl)
+      .setName('Manage Connections')
+      .setDesc('Discover Notion databases and add mappings, or test your token')
+      .addButton(btn => {
+        btn.setButtonText('Add from Notion')
+          .setCta()
+          .onClick(async () => {
+            const notion: any = (this.plugin as any).notionClient;
+            if (!notion) {
+              new Notice('Notion client not initialized. Set your token first.');
+              return;
+            }
+            const rateLimiter: any = (this.plugin as any).rateLimiter;
+            const modal = new DatabasePickerModal(this.app, async (db) => {
+              this.plugin.settings.connections = this.plugin.settings.connections ?? [];
+              const folder = suggestFolderFromDbTitle(db.title);
+              this.plugin.settings.connections.push({ databaseId: db.id, destinationFolder: folder });
+              await this.plugin.saveSettings();
+              renderConnections();
+              new Notice(`Added mapping: ${db.title} → ${folder}`);
+            }, notion, rateLimiter);
+            modal.open();
+          });
+      })
+      .addButton(btn => {
+        btn.setButtonText('Test Notion Connection')
+          .onClick(async () => {
+            const notion: any = (this.plugin as any).notionClient;
+            if (!notion) {
+              new Notice('Notion client not initialized. Set your token first.');
+              return;
+            }
+            const rateLimiter: any = (this.plugin as any).rateLimiter;
+            const res = await testNotionAuth(notion, rateLimiter);
+            if (res.ok) new Notice('Notion connection OK');
+            else new Notice(res.message);
+          });
+      });
 
     const renderConnections = () => {
       connectionsWrapper.empty();
@@ -381,6 +422,56 @@ export class FileSuggestModal extends SuggestModal<string> {
       this.textComponent.inputEl.removeEventListener('focus', listener);
       delete (this.textComponent.inputEl as any)._fileSuggestListener;
     }
+    this.close();
+  }
+}
+
+// Utilities and modal for Notion database picking
+function suggestFolderFromDbTitle(title: string): string {
+  const safe = title
+    .replace(/[^a-zA-Z0-9\s\/\-_]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return safe ? `Notion/${safe}` : 'Notion/Database';
+}
+
+type DatabaseLite = { id: string; title: string; url?: string; icon?: string | null };
+
+class DatabasePickerModal extends SuggestModal<DatabaseLite> {
+  private items: DatabaseLite[] = [];
+  private loaded = false;
+
+  constructor(app: App, private onPick: (db: DatabaseLite) => void, private notion: any, private rateLimiter: any) {
+    super(app);
+  }
+
+  async onOpen() {
+    try {
+      this.setPlaceholder('Search databases…');
+      this.items = await notionSearchDatabases(this.notion, this.rateLimiter);
+      this.loaded = true;
+    } catch (e: any) {
+      new Notice(`Failed to list Notion databases: ${e?.message || e}`);
+      this.close();
+    }
+  }
+
+  getSuggestions(query: string): DatabaseLite[] {
+    if (!this.loaded) return [];
+    const q = query.toLowerCase();
+    return this.items
+      .filter(d => d.title.toLowerCase().includes(q) || d.id.toLowerCase().includes(q))
+      .slice(0, 100);
+  }
+
+  renderSuggestion(value: DatabaseLite, el: HTMLElement) {
+    const name = el.createDiv({ cls: 'suggestion-content' });
+    name.createEl('div', { text: value.title });
+    name.createEl('div', { text: value.id, cls: 'suggestion-hotkey' });
+  }
+
+  onChooseSuggestion(item: DatabaseLite) {
+    this.onPick(item);
     this.close();
   }
 }

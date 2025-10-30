@@ -1,7 +1,7 @@
 import { Notice, TFile } from 'obsidian';
 import type { Client } from '@notionhq/client';
 import type { PageObjectResponse, BlockObjectResponse } from '@notionhq/client/build/src/api-endpoints';
-import { withRetry, listAllChildBlocks } from '../utils';
+import { withRetry, listAllChildBlocks, replaceFrontmatterField } from '../utils';
 
 export interface ImportContext {
   notion: Client;
@@ -15,21 +15,39 @@ export interface ImportContext {
     modify: (file: TFile, content: string) => Promise<void>;
   };
   getPageContent: (pageId: string) => Promise<string>;
+  execute?: <T>(fn: () => Promise<T>, priority?: number) => Promise<T>;
 }
 
 export async function importDatabase(ctx: ImportContext, databaseId: string): Promise<number> {
   await ctx.appVault.ensureFolderExists(ctx.destinationFolder);
 
-  const db = await withRetry(() => ctx.notion.databases.retrieve({ database_id: databaseId }));
+  const exec = async <T>(fn: () => Promise<T>, priority: number = 1): Promise<T> => {
+    if (ctx.execute) return ctx.execute(fn, priority);
+    return withRetry(fn);
+  };
 
-  const response = await withRetry(() => ctx.notion.databases.query({ database_id: databaseId }));
-  if (!response.results || response.results.length === 0) {
+  await exec(() => ctx.notion.databases.retrieve({ database_id: databaseId }), 2);
+
+  // Fetch all pages with pagination
+  let allResults: any[] = [];
+  let startCursor: string | undefined = undefined;
+  do {
+    const page = await exec(() => ctx.notion.databases.query({
+      database_id: databaseId,
+      page_size: 100,
+      start_cursor: startCursor,
+    }), 1);
+    allResults = allResults.concat(page.results || []);
+    startCursor = (page as any).next_cursor ?? undefined;
+  } while (startCursor);
+
+  if (allResults.length === 0) {
     new Notice('No entries found in the database');
     return 0;
   }
 
   let createdOrUpdated = 0;
-  for (const page of response.results) {
+  for (const page of allResults) {
     if (!('properties' in page)) continue;
 
     let title = 'Untitled';
@@ -60,6 +78,17 @@ export async function importDatabase(ctx: ImportContext, databaseId: string): Pr
         await ctx.appVault.modify(existingFile, content);
         createdOrUpdated++;
         new Notice(`Updated ${existingFile.basename} from Notion`);
+        continue;
+      }
+
+      // Normalize required frontmatter fields even when Notion is not newer
+      let normalized = replaceFrontmatterField(localContent, 'notion_page_id', page.id);
+      normalized = replaceFrontmatterField(normalized, 'imported_from', 'notion');
+      if (notionEdited) {
+        normalized = replaceFrontmatterField(normalized, 'last_edited_time', notionEdited);
+      }
+      if (normalized !== localContent) {
+        await ctx.appVault.modify(existingFile, normalized);
       }
       continue;
     }

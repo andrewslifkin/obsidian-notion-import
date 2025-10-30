@@ -6,6 +6,7 @@ Import entries from your Notion databases directly into Obsidian. This plugin al
 
 - Import entries from any Notion database
 - Multiple database ↔ folder mappings
+- In-app Notion database picker (no need to paste IDs)
 - Customizable file naming patterns
 - Configurable destination folder
 - Automatic syncing on a schedule
@@ -13,6 +14,7 @@ Import entries from your Notion databases directly into Obsidian. This plugin al
 - Preserves basic Notion formatting
 - Enhanced bidirectional sync (keep the latest version)
 - Smart conflict resolution between Notion and Obsidian
+- Per-database import summaries and improved error messages
 
 ## Setup
 
@@ -27,15 +29,13 @@ Import entries from your Notion databases directly into Obsidian. This plugin al
    - Click the "..." menu in the top right
    - Click "Add connections"
    - Select your integration
-4. Get your database ID:
-   - Open your database in Notion
-   - The ID is in the URL: `https://www.notion.so/workspace-name/database-id?v=...`
-5. Configure the plugin:
+4. Configure the plugin:
    - Open Obsidian settings
    - Go to the "Notion Importer" tab
    - Enter your Notion token
-   - Under "Connections (Database ↔ Folder)", click "Add" to create one or more mappings
-   - For each mapping, set the Notion Database ID and the destination Obsidian folder
+   - Under "Connections (Database ↔ Folder)", click "Add from Notion" to pick one or more databases from your workspace
+   - A suggested destination folder will be populated; adjust if desired
+   - Optionally, use "Test Notion Connection" to validate your token and permissions
    - Configure other options as desired
 
 ## Usage
@@ -82,3 +82,9 @@ npm run build
 ## License
 
 MIT 
+
+## Troubleshooting
+
+- Invalid token (401): Use "Test Notion Connection" and ensure the token is correct.
+- No databases appear in picker: Share the database with your integration in Notion (Add connections).
+- Rate limit (429): The plugin uses a conservative, adaptive rate limiter. If you still hit limits, try again later or reduce auto-import frequency.
